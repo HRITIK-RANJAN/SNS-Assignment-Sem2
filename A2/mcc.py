@@ -116,7 +116,7 @@ class MissionControlCenter:
         - Signature (variable length with length prefix)
         """
         try:
-            # Prepare message M0 = p || g || SL || TS0 || IDMCC
+            # Prepare message M0 = p || g || SL || TS0 || IDMCC || Y_MCC
             ts0 = int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF  # 8 bytes
             idmcc = b"MCC_PRIMARY"
             
@@ -126,6 +126,8 @@ class MissionControlCenter:
             msg_data += struct.pack('>I', self.security_level)
             msg_data += struct.pack('>Q', ts0)
             msg_data += int_to_bytes_variable(bytes_to_int(idmcc))
+            # Include MCC's public key so drone can encrypt with it
+            msg_data += int_to_bytes_variable(self.keypair.y)
             
             # Sign message
             msg_hash = hash_sha256_int(msg_data) % (self.p - 1)
@@ -138,8 +140,9 @@ class MissionControlCenter:
             full_msg += msg_data
             full_msg += sig_data
             
-            # Send
-            client_socket.sendall(full_msg)
+            # Send with length prefix so drone receives complete message
+            length_prefix = struct.pack('>I', len(full_msg))
+            client_socket.sendall(length_prefix + full_msg)
             print(f"[MCC] Phase 0: Sent parameters to client")
             
         except Exception as e:
@@ -249,7 +252,7 @@ class MissionControlCenter:
         try:
             # Generate MCC timestamp and nonce
             tsmcc = int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF
-            rnmcc = struct.pack('>Q', tsmcc ^ 0xDEADBEEF)  # Simple nonce
+            rnmcc = struct.pack('>Q', tsmcc ^ 0xDEADBEEF)
             rnmcc += struct.pack('>Q', int(time.time() * 1000000) ^ 0xCAFEBABE)
             rnmcc = (rnmcc + b'\x00' * 32)[:32]  # Pad to 32 bytes
             
@@ -258,25 +261,15 @@ class MissionControlCenter:
             
             idmcc = b"MCC_PRIMARY"
             
-            # Create public key for drone (for demo, we create a dummy one)
-            # In real system, this comes from PKI
-            drone_public_key = ElGamalKey(self.p, self.g, y=42)  # Dummy
-            session.drone_public_key = drone_public_key
+            # Prove knowledge of shared secret by sending HMAC
+            secret_bytes = int_to_bytes(session.shared_secret)
+            proof = hmac_sha256(hash_sha256(secret_bytes), idmcc + struct.pack('>Q', tsmcc))
             
-            # Encrypt shared secret with drone's "public key"
-            # For demo: just use the shared secret directly
-            shared_secret = session.shared_secret
-            
-            # For this implementation, send encrypted with a test key
-            # In real system, would use drone's actual public key
-            encrypted_secret = elgamal_encrypt(shared_secret, drone_public_key)
-            
-            # Create message M1B = TSMCC || RNMCC || IDMCC || CMCC
+            # Create message M1B = TSMCC || RNMCC || IDMCC || proof
             msg_1b = struct.pack('>Q', tsmcc)
             msg_1b += rnmcc
             msg_1b += struct.pack('>I', len(idmcc)) + idmcc
-            msg_1b += int_to_bytes_variable(encrypted_secret[0])
-            msg_1b += int_to_bytes_variable(encrypted_secret[1])
+            msg_1b += proof  # 32 bytes HMAC proof
             
             # Sign message
             msg_hash = hash_sha256_int(msg_1b) % (self.p - 1)
@@ -288,8 +281,9 @@ class MissionControlCenter:
             full_msg += int_to_bytes_variable(signature[0])
             full_msg += int_to_bytes_variable(signature[1])
             
-            # Send
-            session.socket.sendall(full_msg)
+            # Send with length prefix
+            length_prefix = struct.pack('>I', len(full_msg))
+            session.socket.sendall(length_prefix + full_msg)
             print(f"[MCC] Phase 1B: Sent response to {session.drone_id}")
             
         except Exception as e:
@@ -305,6 +299,7 @@ class MissionControlCenter:
         
         Receives:
         - OPCODE: 40 (1 byte)
+        - TSfinal: Drone's final timestamp (8 bytes)
         - HMAC: HMAC-SHA256(SKDi,MCC, IDDi || TSfinal) (32 bytes)
         """
         try:
@@ -312,9 +307,16 @@ class MissionControlCenter:
                 print(f"[MCC] Invalid opcode in Phase 2: {data[0]}")
                 return False
             
-            # Derive session key using same formula
-            # SKDi,MCC = SHA256(KDi,MCC || TSi || TSMCC || RNi || RNMCC)
-            sk_material = int_to_bytes(session.shared_secret, 32)
+            # Parse TSfinal sent by drone
+            ts_final = data[1:9]
+            received_hmac = data[9:41]
+            
+            # Derive session key using same formula as drone
+            # SKDi,MCC = SHA256(H(KDi,MCC) || TSi || TSMCC || RNi || RNMCC)
+            secret_bytes = int_to_bytes(session.shared_secret)
+            secret_hash = hash_sha256(secret_bytes)
+            
+            sk_material = secret_hash
             sk_material += struct.pack('>Q', session.timestamp_drone)
             sk_material += struct.pack('>Q', session.timestamp_mcc)
             sk_material += session.nonce_drone
@@ -322,15 +324,11 @@ class MissionControlCenter:
             
             session.session_key = hash_sha256(sk_material)
             
-            # Compute expected HMAC
-            final_ts = struct.pack('>Q', int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF)
+            # Compute expected HMAC using the SAME TSfinal the drone sent
             hmac_data = session.drone_id.encode('utf-8') if isinstance(session.drone_id, str) else session.drone_id
-            hmac_data += final_ts
+            hmac_data += ts_final
             
             expected_hmac = hmac_sha256(session.session_key, hmac_data)
-            
-            # Compare with received HMAC
-            received_hmac = data[1:33]
             
             if expected_hmac == received_hmac:
                 # Success - mark as authenticated
@@ -359,6 +357,26 @@ class MissionControlCenter:
     # Connection Handler
     # ========================================================================
     
+    def recv_message(self, sock):
+        """Receive a length-prefixed message from socket."""
+        # Read 4-byte length prefix
+        length_data = b''
+        while len(length_data) < 4:
+            chunk = sock.recv(4 - len(length_data))
+            if not chunk:
+                return None
+            length_data += chunk
+        msg_len = struct.unpack('>I', length_data)[0]
+        
+        # Read the full message
+        data = b''
+        while len(data) < msg_len:
+            chunk = sock.recv(min(8192, msg_len - len(data)))
+            if not chunk:
+                return None
+            data += chunk
+        return data
+    
     def handle_drone_connection(self, client_socket, address):
         """
         Thread function to handle a single drone connection.
@@ -379,10 +397,11 @@ class MissionControlCenter:
             self.send_phase0_params(client_socket)
             time.sleep(0.1)
             
-            # Phase 1A: Receive auth request
-            data = client_socket.recv(4096)
+            # Phase 1A: Receive auth request (length-prefixed)
+            data = self.recv_message(client_socket)
             if not data or not self.process_phase1a_auth_request(data, client_socket, session):
                 print(f"[MCC] Phase 1A failed")
+                print("MCC> ", end='', flush=True)  # Reprint prompt after failed auth
                 return
             
             time.sleep(0.1)
@@ -391,26 +410,41 @@ class MissionControlCenter:
             self.send_phase1b_response(session)
             time.sleep(0.1)
             
-            # Phase 2: Receive confirmation
-            data = client_socket.recv(4096)
+            # Phase 2: Receive confirmation (length-prefixed)
+            data = self.recv_message(client_socket)
             if not data or not self.process_phase2_confirmation(session, data):
                 print(f"[MCC] Phase 2 failed")
+                print("MCC> ", end='', flush=True)  # Reprint prompt after failed auth
                 return
             
             print(f"[MCC] {session.drone_id} fully authenticated")
             
+            # Re-print CLI prompt so it's visible after connection messages
+            print("MCC> ", end='', flush=True)
+            
             # Phase 3: Keep connection alive for commands/broadcasts
+            # The CLI thread handles sending via session.socket.sendall()
+            # This thread only monitors for disconnection
             while self.running and session.authenticated:
                 try:
-                    # Wait for incoming messages with timeout
-                    client_socket.settimeout(5.0)
-                    data = client_socket.recv(1)
-                    if not data:
+                    # Use select to check for incoming data without blocking
+                    import select
+                    readable, _, exceptional = select.select([client_socket], [], [client_socket], 2.0)
+                    
+                    if exceptional:
+                        print(f"[MCC] Socket exception for {session.drone_id}")
                         break
-                    # Handle incoming messages if needed
+                    
+                    if readable:
+                        # Check if connection is still alive
+                        data = client_socket.recv(1, socket.MSG_PEEK)
+                        if not data:
+                            print(f"[MCC] {session.drone_id} disconnected")
+                            break
+                    
                 except socket.timeout:
                     continue
-                except:
+                except Exception:
                     break
             
         except Exception as e:
@@ -428,6 +462,9 @@ class MissionControlCenter:
                 pass
             
             print(f"[MCC] Closed connection from {address}")
+            
+            # Re-print CLI prompt so it's visible after connection closes
+            print("MCC> ", end='', flush=True)
     
     # ========================================================================
     # Server Main Loop
@@ -441,6 +478,8 @@ class MissionControlCenter:
         try:
             self.server_socket.bind((self.host, self.port))
             self.server_socket.listen(5)
+            # Set socket timeout to 1 second so it doesn't block forever
+            self.server_socket.settimeout(1.0)
             self.running = True
             
             print(f"[MCC] Server listening on {self.host}:{self.port}")
@@ -449,7 +488,7 @@ class MissionControlCenter:
                 try:
                     client_socket, address = self.server_socket.accept()
                     
-                    # Handle in separate thread
+                    # Handle in separate thread (daemon=True is OK here for individual connections)
                     thread = threading.Thread(
                         target=self.handle_drone_connection,
                         args=(client_socket, address),
@@ -458,6 +497,9 @@ class MissionControlCenter:
                     thread.start()
                     self.threads.append(thread)
                     
+                except socket.timeout:
+                    # Timeout is normal - allows CLI to process input
+                    continue
                 except KeyboardInterrupt:
                     break
                 except Exception as e:
@@ -488,12 +530,12 @@ class MissionControlCenter:
         """
         with self.drones_lock:
             if not self.drones:
-                print("[MCC] No authenticated drones to broadcast to")
+                print("[MCC] No authenticated drones to broadcast to", flush=True)
                 return
             
             auth_drones = [s for s in self.drones.values() if s.authenticated]
             if not auth_drones:
-                print("[MCC] No authenticated drones")
+                print("[MCC] No authenticated drones", flush=True)
                 return
             
             # Step 1: Collect all session keys
@@ -545,7 +587,7 @@ class MissionControlCenter:
         """Display all connected drones."""
         with self.drones_lock:
             if not self.drones:
-                print("No drones connected")
+                print("No drones connected", flush=True)
                 return
             
             print("\n" + "="*70)
@@ -560,12 +602,7 @@ class MissionControlCenter:
             
             print("-" * 70)
             print(f"Total: {len(self.drones)} drone(s)")
-            print("="*70 + "\n")
-    
-    def cmd_broadcast(self, command):
-        """Send command to all drones."""
-        print(f"\n[MCC] Broadcasting command: {command}")
-        self.cmd_broadcast(command)
+            print("="*70 + "\n", flush=True)
     
     def cmd_shutdown(self):
         """Shutdown server."""
@@ -595,37 +632,87 @@ class MissionControlCenter:
     
     def cli_interface(self):
         """Interactive CLI for MCC operator."""
-        print("\n[MCC] Command Interface Ready")
-        print("Commands: list | broadcast <cmd> | shutdown | status")
+        # Wait a moment for server to fully initialize
+        time.sleep(0.5)
+        
+        print("\n" + "="*70)
+        print("[MCC] COMMAND INTERFACE READY")
         print("="*70)
+        print("Available Commands:")
+        print("  list              - Show all authenticated drones")
+        print("  broadcast <cmd>   - Send encrypted command to all drones")
+        print("  status            - Show server statistics")
+        print("  shutdown          - Gracefully shutdown server")
+        print("="*70)
+        print("\nType your command below:")
+        print("="*70 + "\n")
+        
+        # Check if stdin is a TTY (interactive terminal)
+        if not sys.stdin.isatty():
+            print("[MCC] Running in non-interactive mode (no TTY detected)")
+            print("[MCC] Server will continue accepting drone connections")
+            print("[MCC] Press Ctrl+C to shutdown")
+            # Keep server running without CLI
+            try:
+                while self.running:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                print("\n[MCC] Shutting down...")
+                self.cmd_shutdown()
+            return
         
         while self.running:
             try:
+                # Flush output before showing prompt
+                sys.stdout.flush()
                 user_input = input("MCC> ").strip()
                 
                 if not user_input:
                     continue
                 
-                if user_input == "list":
+                cmd_lower = user_input.lower()
+                
+                if cmd_lower == "list":
                     self.cmd_list_drones()
                 
-                elif user_input == "status":
+                elif cmd_lower == "status":
                     with self.drones_lock:
-                        print(f"\nServer running: {self.running}")
+                        print(f"\n{'='*70}")
+                        print("SERVER STATUS")
+                        print(f"{'-'*70}")
+                        print(f"Server running: {self.running}")
                         print(f"Connected drones: {len(self.drones)}")
                         auth_count = sum(1 for s in self.drones.values() if s.authenticated)
                         print(f"Authenticated: {auth_count}")
+                        print(f"{'='*70}\n", flush=True)
                 
-                elif user_input.startswith("broadcast "):
+                elif cmd_lower.startswith("broadcast "):
                     cmd = user_input[10:]
+                    print()  # Add blank line before output
                     self.cmd_broadcast(cmd)
+                    print()  # Add blank line after output
                 
-                elif user_input == "shutdown":
+                elif cmd_lower == "shutdown":
                     self.cmd_shutdown()
                     break
                 
+                elif cmd_lower == "help":
+                    print("\n" + "="*70)
+                    print("AVAILABLE COMMANDS")
+                    print("="*70)
+                    print("  list              - Show all authenticated drones")
+                    print("  broadcast <cmd>   - Send encrypted command to all drones")
+                    print("  status            - Show server statistics")
+                    print("  shutdown          - Gracefully shutdown server")
+                    print("  help              - Show this help message")
+                    print("="*70 + "\n")
+                
                 else:
-                    print("Unknown command. Use: list | broadcast <cmd> | shutdown | status")
+                    print("\n" + "="*70)
+                    print("UNKNOWN COMMAND")
+                    print("="*70)
+                    print("Use: list | broadcast <cmd> | status | shutdown | help")
+                    print("="*70 + "\n", flush=True)
                 
             except KeyboardInterrupt:
                 print("\n[MCC] Shutting down...")
@@ -654,8 +741,8 @@ def main():
         security_level=args.security_level
     )
     
-    # Start server in background thread
-    server_thread = threading.Thread(target=mcc.start_server, daemon=True)
+    # Start server in background thread (NOT daemon, so it keeps process alive)
+    server_thread = threading.Thread(target=mcc.start_server, daemon=False)
     server_thread.start()
     
     # Run CLI in main thread
@@ -665,6 +752,7 @@ def main():
         print("\n[MCC] Interrupted")
     finally:
         mcc.running = False
+        server_thread.join(timeout=2)  # Wait for server thread to finish
         time.sleep(1)
 
 

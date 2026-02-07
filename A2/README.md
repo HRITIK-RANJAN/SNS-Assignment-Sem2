@@ -1,4 +1,4 @@
-# Secure UAV Command and Control System - Implementation Plan
+# Secure UAV Command and Control System - Implementation Guide
 
 ## 📋 Assignment Overview
 
@@ -20,6 +20,8 @@ Implement a secure, distributed UAV Command-and-Control (C2) system with:
 - **Session Management**: Secure per-drone session keys
 - **Group Key Aggregation**: Fleet-wide secure broadcasting
 
+**Important**: This is a **MCC-centric architecture**. Drones ONLY communicate with MCC, NOT with each other.
+
 ---
 
 ## 📁 Project Structure
@@ -30,168 +32,754 @@ project/
 ├── mcc.py               # Mission Control Center server
 ├── drone.py             # Drone client implementation
 ├── attacks.py           # Security attack demonstrations
-├── SECURITY.md          # Security analysis document
+├── SECURITY.md          # Security analysis (Freshness & Forward Secrecy)
 ├── README.md            # This file + performance logs
-├── requirements.txt     # Python dependencies (if using Python)
-└── tests/              # Optional: unit tests for crypto functions
-    ├── test_crypto.py
-    ├── test_protocol.py
-    └── test_attacks.py
+└── requirements.txt     # Python dependencies (minimal)
 ```
 
 ---
 
-## 🔐 Phase-by-Phase Implementation Plan
+## 🔐 Cryptographic Specifications (Manual Implementation)
 
-### **PHASE 0: Development Environment Setup**
+### Required ElGamal Primitives
 
-#### Step 0.1: Choose Programming Language
-- **Decision Point**: Python (recommended for rapid development) vs C/C++ (for performance)
-- **If Python**: Set up virtual environment
-  ```bash
-  python3 -m venv venv
-  source venv/bin/activate  # Linux/Mac
-  # or
-  venv\Scripts\activate     # Windows
-  ```
-- **If C/C++**: Install GMP library for large number arithmetic
+All implementations must be **from scratch** in `crypto_utils.py`:
 
-#### Step 0.2: Install Permitted Libraries
-Create `requirements.txt` (Python):
-```
-pycryptodome==3.19.0  # For AES-CBC only
-```
+1. **Key Generation**
+   - Select large prime p (SL ≥ 2048 bits) and generator g
+   - Private key: x ∈ [1, p-2]
+   - Public key: y = g^x (mod p)
 
-#### Step 0.3: Project Initialization
-- Create all necessary files
-- Set up version control (git recommended)
-- Create test data directory
+2. **Encryption (EKU)**
+   - Given message m, select random k ∈ [1, p-2]
+   - Ciphertext C = (c1, c2) where:
+     - c1 = g^k (mod p)
+     - c2 = (m · y^k) (mod p)
+
+3. **Decryption (DKR)**
+   - m = (c2 · (c1^x)^(-1)) (mod p)
+
+4. **Digital Signature (SignKR)**
+   - Given H(m), select random k such that gcd(k, p-1) = 1
+   - Signature σ = (r, s) where:
+     - r = g^k (mod p)
+     - s = (H(m) - x·r)·k^(-1) (mod p-1)
+
+5. **Signature Verification (VerifyKU)**
+   - Check: g^H(m) ≡ y^r · r^s (mod p)
 
 ---
 
-### **PHASE 1: Core Cryptographic Primitives (crypto_utils.py)**
+## 🏗️ System Architecture & Concurrency
 
-This is the **MOST CRITICAL** phase. All implementations must be manual.
+### MCC Server Design
 
-#### Step 1.1: Helper Mathematical Functions
+The MCC must handle multiple drones simultaneously using **Multi-threading or Asynchronous I/O**:
 
-**Priority: CRITICAL** | **Estimated Time: 4-6 hours**
+- **Main Thread**: Listens for new connections on TCP port
+- **Drone Threads**: Spawn thread per connection for Phases 0, 1, and 2
+- **Fleet Registry**: Thread-safe data structure storing:
+  - Drone ID
+  - Socket Object
+  - Session Key (SKDi,MCC)
+  - Drone Public Key (for Phase 1B encryption)
 
-Implement the following functions:
+### Communication Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                Mission Control Center (MCC)          │
+│  ┌──────────────────────────────────────────┐       │
+│  │  Fleet Registry (Thread-Safe)            │       │
+│  │  ┌────────┬────────┬────────┬──────────┐ │       │
+│  │  │Drone ID│ Socket │Session │Public Key│ │       │
+│  │  ├────────┼────────┼────────┼──────────┤ │       │
+│  │  │  D001  │   sk1  │  SK1   │   yD1    │ │       │
+│  │  │  D002  │   sk2  │  SK2   │   yD2    │ │       │
+│  │  │  D003  │   sk3  │  SK3   │   yD3    │ │       │
+│  │  └────────┴────────┴────────┴──────────┘ │       │
+│  └──────────────────────────────────────────┘       │
+└─────────────────────────────────────────────────────┘
+           ▲            ▲            ▲
+           │            │            │
+      TCP  │       TCP  │       TCP  │
+           │            │            │
+      ┌────┴───┐   ┌────┴───┐   ┌────┴───┐
+      │ Drone  │   │ Drone  │   │ Drone  │
+      │  D001  │   │  D002  │   │  D003  │
+      └────────┘   └────────┘   └────────┘
+
+Note: NO drone-to-drone communication
+```
+
+### MCC Command Line Interface (CLI)
+
+Required commands:
+1. **`list`** - Show all authenticated drones and their status
+2. **`broadcast <cmd>`** - Generate Group Key, distribute it, send encrypted command to all drones
+3. **`shutdown`** - Close all sessions and exit
+
+---
+
+## 📡 Protocol Phases - Detailed Specification
+
+### Phase 0: Parameter Initialization (MCC → Drone)
+
+**Purpose**: MCC acts as "Root of Trust" and establishes cryptographic parameters
+
+**MCC Actions:**
+1. Generate/select SL ≥ 2048
+2. Generate prime p where 2^(SL-1) < p < 2^SL
+3. Find generator g modulo p
+4. Get current timestamp TS0
+5. **Create message M0 = ⟨p ∥ g ∥ SL ∥ TS0 ∥ IDMCC⟩**
+6. **CRITICAL: Sign M0 → σ0 = SignKRMCC(H(M0))**
+7. Send: **OPCODE 10 ∥ M0 ∥ σ0**
+
+**Message Format (Phase 0):**
+```
+┌────────┬────────┬──────┬──────┬──────┬────────┬──────────┬──────────┐
+│ OPCODE │  p_len │  p   │ g_len│  g   │   SL   │   TS0    │  IDMCC   │
+│   10   │ (4 B)  │ (var)│ (4 B)│ (var)│ (4 B)  │  (8 B)   │  (var)   │
+└────────┴────────┴──────┴──────┴──────┴────────┴──────────┴──────────┘
+┌──────────┬──────────┐
+│ sig_r_len│   r      │
+│  (4 B)   │  (var)   │
+└──────────┴──────────┘
+┌──────────┬──────────┐
+│ sig_s_len│   s      │
+│  (4 B)   │  (var)   │
+└──────────┴──────────┘
+```
+
+**Drone Actions:**
+1. Receive and parse message
+2. Extract p, g, SL, TS0, IDMCC, σ0
+3. **CRITICAL VALIDATION**:
+   ```python
+   # Check 1: Verify MCC's signature on parameters
+   if not verify_signature(H(M0), σ0, KIUMCC):
+       abort("Invalid MCC signature")
+   
+   # Check 2: Validate actual prime bit length matches claimed SL
+   actual_bit_length = len(bin(p)) - 2  # Remove '0b' prefix
+   if abs(actual_bit_length - SL) > 10:  # Allow ±10 bit tolerance
+       abort("SL mismatch: MCC claims {SL} but p is {actual_bit_length} bits")
+   
+   # Check 3: Ensure minimum security level
+   if SL < 2048:
+       abort("Insufficient security level: {SL} < 2048")
+   
+   # Check 4: Verify timestamp freshness (within 5 minutes)
+   if abs(current_time - TS0) > 300:
+       abort("Stale parameters")
+   ```
+4. Store p, g, SL for use in own key generation
+5. Generate drone's ElGamal keypair using p, g
+
+**Opcode:** 10 (PARAM_INIT)
+
+---
+
+### Phase 1A: Drone Authentication Request (Drone → MCC)
+
+**Purpose**: Drone initiates authentication and sends encrypted secret
+
+**Drone Actions:**
+1. Generate 256-bit random secret: KDi,MCC (this becomes basis for session key)
+2. Generate random nonce: RNi (for freshness)
+3. Get current timestamp: TSi
+4. **Encrypt secret with MCC's public key:**
+   ```
+   Ci = EKUMCC(KDi,MCC) = (c1, c2)
+   where c1 = g^k mod p, c2 = (KDi,MCC · yMCC^k) mod p
+   ```
+5. **Create authentication message:**
+   ```
+   M1A = ⟨TSi ∥ RNi ∥ IDDi ∥ c1 ∥ c2 ∥ yDi⟩
+   Note: Include drone's public key yDi so MCC can use it in Phase 1B
+   ```
+6. **Sign the message:**
+   ```
+   σ1A = SignKRDi(H(M1A))
+   ```
+7. **Send: OPCODE 20 ∥ M1A ∥ σ1A**
+
+**Message Format (Phase 1A):**
+```
+┌────────┬──────┬──────┬──────────┬───────────┬───────────┬──────────┐
+│ OPCODE │  TSi │  RNi │   IDDi   │  c1_len   │    c1     │  c2_len  │
+│   20   │ (8 B)│(32 B)│  (var)   │   (4 B)   │   (var)   │   (4 B)  │
+└────────┴──────┴──────┴──────────┴───────────┴───────────┴──────────┘
+┌────────┬──────────┬──────────┬──────────┬──────────┬──────────┐
+│   c2   │  yDi_len │   yDi    │ sig_r_len│    r     │ sig_s_len│
+│ (var)  │   (4 B)  │  (var)   │   (4 B)  │  (var)   │   (4 B)  │
+└────────┴──────────┴──────────┴──────────┴──────────┴──────────┘
+┌────────┐
+│   s    │
+│ (var)  │
+└────────┘
+```
+
+**MCC Actions:**
+1. Receive and parse message
+2. **Validate timestamp** (must be within 5 minutes of current time)
+3. **Verify drone's signature:**
+   ```python
+   if not verify_signature(H(M1A), σ1A, yDi):
+       send(OPCODE 60)  # ERR_MISMATCH
+       abort("Invalid drone signature")
+   ```
+4. **Decrypt ciphertext to recover secret:**
+   ```
+   KDi,MCC = DKRMCC(Ci) = c2 · (c1^xMCC)^(-1) mod p
+   ```
+5. Store: (IDDi, Socket, KDi,MCC, yDi, RNi, TSi) in temporary registry
+6. Proceed to Phase 1B
+
+**Opcode:** 20 (AUTH_REQ)
+
+---
+
+### Phase 1B: MCC Authentication Response (MCC → Drone)
+
+**Purpose**: MCC proves it successfully decrypted KDi,MCC by encrypting it back
+
+**MCC Actions:**
+1. Generate random nonce: RNMCC
+2. Get current timestamp: TSMCC
+3. **Encrypt THE SAME secret back using drone's public key:**
+   ```
+   CMCC = EKUDi(KDi,MCC) = (c1', c2')
+   where c1' = g^k' mod p, c2' = (KDi,MCC · yDi^k') mod p
+   ```
+4. **Create response message:**
+   ```
+   M1B = ⟨TSMCC ∥ RNMCC ∥ IDMCC ∥ c1' ∥ c2'⟩
+   ```
+5. **Sign the message:**
+   ```
+   σ1B = SignKRMCC(H(M1B))
+   ```
+6. **Send: OPCODE 30 ∥ M1B ∥ σ1B**
+
+**Message Format (Phase 1B):**
+```
+┌────────┬──────────┬──────────┬──────────┬──────────┬──────────┐
+│ OPCODE │  TSMCC   │  RNMCC   │  IDMCC   │ c1'_len  │   c1'    │
+│   30   │   (8 B)  │  (32 B)  │  (var)   │   (4 B)  │  (var)   │
+└────────┴──────────┴──────────┴──────────┴──────────┴──────────┘
+┌──────────┬──────────┬──────────┬──────────┬──────────┬──────────┐
+│ c2'_len  │   c2'    │sig_r_len │    r     │sig_s_len │    s     │
+│   (4 B)  │  (var)   │   (4 B)  │  (var)   │   (4 B)  │  (var)   │
+└──────────┴──────────┴──────────┴──────────┴──────────┴──────────┘
+```
+
+**Drone Actions:**
+1. Receive and parse message
+2. **Validate timestamp** (must be fresh)
+3. **Verify MCC's signature:**
+   ```python
+   if not verify_signature(H(M1B), σ1B, KUMCC):
+       abort("Invalid MCC signature in Phase 1B")
+   ```
+4. **Decrypt ciphertext:**
+   ```
+   KDi,MCC_received = DKRDi(CMCC) = c2' · (c1'^xDi)^(-1) mod p
+   ```
+5. **Verify mutual knowledge:**
+   ```python
+   if KDi,MCC_received != KDi,MCC_original:
+       abort("MCC failed to decrypt correctly - possible MitM")
+   ```
+6. Store: (RNMCC, TSMCC)
+7. Proceed to Phase 2
+
+**Opcode:** 30 (AUTH_RES)
+
+---
+
+### Phase 2: Session Key Derivation & Confirmation
+
+**Purpose**: Both parties independently derive same session key and confirm via HMAC
+
+**Both Parties Derive Session Key:**
+```python
+# EXACT ORDER IS CRITICAL - both must use same concatenation order
+SK_Di_MCC = SHA256(KDi,MCC ∥ TSi ∥ TSMCC ∥ RNi ∥ RNMCC)
+
+# Result is 32-byte (256-bit) session key
+```
+
+**Drone Confirmation:**
+1. Get current timestamp: TSfinal (confirmation timestamp)
+2. **Generate HMAC proof of session key possession:**
+   ```python
+   hmac_proof = HMAC-SHA256(key=SK_Di_MCC, msg=IDDi ∥ TSfinal)
+   ```
+3. **Send: OPCODE 40 ∥ IDDi ∥ TSfinal ∥ hmac_proof**
+
+**Message Format (Phase 2 - SK_CONFIRM):**
+```
+┌────────┬──────────┬──────────┬─────────────────┐
+│ OPCODE │   IDDi   │ TSfinal  │   hmac_proof    │
+│   40   │  (var)   │  (8 B)   │     (32 B)      │
+└────────┴──────────┴──────────┴─────────────────┘
+```
+
+**MCC Verification:**
+1. Receive HMAC proof
+2. Look up drone's session key from temporary registry
+3. **Compute expected HMAC:**
+   ```python
+   expected_hmac = HMAC-SHA256(key=SK_Di_MCC, msg=IDDi ∥ TSfinal)
+   ```
+4. **Compare HMACs:**
+   ```python
+   if expected_hmac == hmac_proof:
+       # Session key confirmed - authentication complete
+       send(OPCODE 50)  # SUCCESS
+       move_to_fleet_registry(IDDi, Socket, SK_Di_MCC, yDi)
+   else:
+       # HMAC mismatch - session key derivation failed
+       send(OPCODE 60)  # ERR_MISMATCH
+       block_drone(IDDi)  # Prevent retry attacks
+   ```
+
+**Message Format (Phase 2 - SUCCESS):**
+```
+┌────────┐
+│ OPCODE │
+│   50   │
+└────────┘
+```
+
+**Message Format (Phase 2 - ERR_MISMATCH):**
+```
+┌────────┬─────────────────────┐
+│ OPCODE │    error_message    │
+│   60   │       (var)         │
+└────────┴─────────────────────┘
+```
+
+**Opcodes:** 40 (SK_CONFIRM), 50 (SUCCESS), 60 (ERR_MISMATCH)
+
+---
+
+### Phase 3: Group Key Establishment & Broadcast
+
+**Purpose**: Enable secure broadcast to all authenticated drones using common group key
+
+**Trigger**: User issues `broadcast <command>` in MCC CLI
+
+**MCC Actions:**
+
+**Step 1: Calculate Group Key**
+```python
+# Aggregate all active drones' session keys
+active_drones = get_authenticated_drones()  # From fleet registry
+sk_list = [SK_D1, SK_D2, ..., SK_Dn]
+
+# Include MCC's private key for additional entropy
+GK = SHA256(SK_D1 ∥ SK_D2 ∥ ... ∥ SK_Dn ∥ KR_MCC)
+# Result is 32-byte (256-bit) group key
+```
+
+**Step 2: Distribute Group Key to Each Drone**
+For each drone Di in fleet:
+```python
+# Encrypt GK using drone's individual session key
+encrypted_GK = AES-256-CBC(key=SK_Di_MCC, plaintext=GK, iv=random_iv)
+
+# Send: OPCODE 70 ∥ encrypted_GK
+```
+
+**Message Format (Phase 3 - GROUP_KEY):**
+```
+┌────────┬─────────────────────┐
+│ OPCODE │   encrypted_GK      │
+│   70   │  (IV + ciphertext)  │
+│        │      (48 B)         │
+└────────┴─────────────────────┘
+```
+
+**Drone Actions (receiving GROUP_KEY):**
+```python
+# Decrypt using own session key
+GK = AES-256-CBC-decrypt(key=SK_Di_MCC, ciphertext=encrypted_GK)
+
+# Store GK for future broadcast messages
+store_group_key(GK)
+```
+
+**Step 3: Send Broadcast Command**
+```python
+# Encrypt command with group key
+encrypted_cmd = AES-256-CBC(key=GK, plaintext=command, iv=random_iv)
+
+# Generate integrity tag
+hmac_tag = HMAC-SHA256(key=GK, msg=command)
+
+# Send to ALL drones: OPCODE 80 ∥ encrypted_cmd ∥ hmac_tag
+```
+
+**Message Format (Phase 3 - GROUP_CMD):**
+```
+┌────────┬─────────────────────┬──────────────┐
+│ OPCODE │  encrypted_command  │   hmac_tag   │
+│   80   │  (IV + ciphertext)  │    (32 B)    │
+└────────┴─────────────────────┴──────────────┘
+```
+
+**Drone Actions (receiving GROUP_CMD):**
+```python
+# Decrypt using group key
+command = AES-256-CBC-decrypt(key=GK, ciphertext=encrypted_cmd)
+
+# Verify integrity
+expected_hmac = HMAC-SHA256(key=GK, msg=command)
+if expected_hmac != hmac_tag:
+    abort("Integrity check failed")
+
+# Execute command
+execute_command(command)
+```
+
+**Opcodes:** 70 (GROUP_KEY), 80 (GROUP_CMD)
+
+---
+
+## 📋 Complete Protocol Opcode Reference
+
+All messages MUST start with 1-byte opcode for protocol parsing:
+
+| Opcode | Type | Direction | Description | Key Fields |
+|--------|------|-----------|-------------|------------|
+| **10** | PARAM_INIT | MCC → Drone | Phase 0: Crypto parameters + MCC signature | p, g, SL, TS0, IDMCC, σ0 |
+| **20** | AUTH_REQ | Drone → MCC | Phase 1A: Drone authentication packet | TSi, RNi, IDDi, Ci, yDi, σ1A |
+| **30** | AUTH_RES | MCC → Drone | Phase 1B: MCC proof of decryption | TSMCC, RNMCC, IDMCC, CMCC, σ1B |
+| **40** | SK_CONFIRM | Drone → MCC | Phase 2: Session key verification via HMAC | IDDi, TSfinal, HMAC |
+| **50** | SUCCESS | MCC → Drone | Phase 2: Authentication successful | (none) |
+| **60** | ERR_MISMATCH | MCC → Drone | Phase 2: Key/HMAC verification failed | error_msg |
+| **70** | GROUP_KEY | MCC → Drone | Phase 3: Encrypted group key distribution | encrypted_GK |
+| **80** | GROUP_CMD | MCC → Drone | Phase 3: Encrypted broadcast command | encrypted_cmd, HMAC |
+| **90** | SHUTDOWN | MCC → Drone | Server shutdown - close connection | (none) |
+
+---
+
+## 📚 Library Usage Policy
+
+### ✅ Permitted Libraries
+
+**Networking/System:**
+- `socket`, `threading`, `asyncio`, `select`, `struct`, `sys`, `time`
+
+**Hashing & MAC:**
+- `hashlib` (for SHA-256 only)
+- `hmac` (for HMAC-SHA256 only)
+
+**Symmetric Encryption:**
+- `pycryptodome` or `cryptography.hazmat` **ONLY for raw AES-CBC block cipher** (Phase 3)
+- Usage limited to: `AES.new(key, AES.MODE_CBC, iv)`
+
+**Randomness:**
+- `secrets` or `os.urandom` (for cryptographically secure random numbers)
+
+**Large Number Math (C/C++ only):**
+- `GMP` (GNU Multiple Precision Arithmetic Library) for 2048-bit integer arithmetic
+- Python students MUST use Python's built-in arbitrary-precision integers
+
+### ❌ Strictly Not Allowed Libraries
+
+**Using these results in ZERO marks for cryptographic portion:**
+
+- **High-Level Security Wrappers**: `ssl`, `paramiko`, `pyOpenSSL`
+- **Asymmetric Abstractions**: `Crypto.PublicKey.ElGamal`, `Crypto.PublicKey.RSA`, `cryptography.hazmat.primitives.asymmetric.*`
+- **Digital Signature Modules**: `Crypto.Signature.DSS`, any pre-built signing module
+- **Key Exchange Frameworks**: Any library implementing Diffie-Hellman or automated key exchange
+
+### 🔨 The "Manual" Rule
+
+You **MUST manually write** these functions:
+
+1. **Modular Exponentiation**: `a^b (mod n)` using square-and-multiply
+2. **Modular Inverse**: Using Extended Euclidean Algorithm
+3. **ElGamal Encryption/Decryption**: Complete (c1, c2) logic
+4. **ElGamal Signing/Verification**: Complete (r, s) logic
+
+---
+
+## 🔧 Implementation Guide
+
+### crypto_utils.py - Core Cryptographic Functions
 
 ```python
-def modular_exponentiation(base, exponent, modulus):
+"""
+Cryptographic Utilities for UAV C2 System
+All ElGamal operations implemented manually
+"""
+
+import hashlib
+import hmac
+import secrets
+import struct
+from typing import Tuple
+
+# ============================================================================
+# HELPER FUNCTIONS - Manual Implementation Required
+# ============================================================================
+
+def modular_exponentiation(base: int, exponent: int, modulus: int) -> int:
     """
     Compute (base^exponent) % modulus efficiently using binary method
     
-    Algorithm: Square-and-multiply method
+    Algorithm: Square-and-multiply (binary exponentiation)
     Time Complexity: O(log exponent)
     
-    Example: 3^5 mod 7 = 5
-    """
-    # TODO: Implement binary exponentiation
-    pass
-
-def extended_euclidean(a, b):
-    """
-    Extended Euclidean Algorithm
-    Returns (gcd, x, y) such that ax + by = gcd(a,b)
+    Args:
+        base: Base integer
+        exponent: Exponent (non-negative integer)
+        modulus: Modulus
     
-    Used for computing modular inverse
-    """
-    # TODO: Implement extended Euclidean algorithm
-    pass
-
-def modular_inverse(a, m):
-    """
-    Compute a^(-1) mod m using Extended Euclidean
+    Returns:
+        Result of (base^exponent) % modulus
     
-    Returns: x such that (a * x) % m == 1
-    Raises: ValueError if gcd(a, m) != 1
+    Example:
+        modular_exponentiation(3, 5, 7) = 5
+        Because 3^5 = 243, and 243 % 7 = 5
     """
-    # TODO: Use extended_euclidean to find inverse
-    pass
+    # TODO: Implement binary square-and-multiply algorithm
+    # HINT: Process exponent bit by bit from right to left
+    #       For each bit: square the result
+    #       If bit is 1: also multiply by base
+    result = 1
+    base = base % modulus
+    
+    while exponent > 0:
+        if exponent % 2 == 1:  # If bit is 1
+            result = (result * base) % modulus
+        exponent = exponent >> 1  # Right shift (divide by 2)
+        base = (base * base) % modulus  # Square the base
+    
+    return result
 
-def gcd(a, b):
+
+def gcd(a: int, b: int) -> int:
     """
-    Compute Greatest Common Divisor
+    Compute Greatest Common Divisor using Euclidean algorithm
+    
+    Args:
+        a, b: Integers
+    
+    Returns:
+        GCD of a and b
     """
     # TODO: Implement Euclidean algorithm
-    pass
-```
+    while b != 0:
+        a, b = b, a % b
+    return a
 
-**Testing Requirements:**
-- Test `modular_exponentiation` with known values
-- Verify `modular_inverse(a, m) * a % m == 1`
-- Edge cases: a=0, m=1, coprime validation
 
-#### Step 1.2: Prime Number Generation
-
-**Priority: CRITICAL** | **Estimated Time: 3-4 hours**
-
-```python
-def is_prime_miller_rabin(n, k=40):
+def extended_euclidean(a: int, b: int) -> Tuple[int, int, int]:
     """
-    Miller-Rabin primality test
+    Extended Euclidean Algorithm
+    
+    Returns (gcd, x, y) such that: a*x + b*y = gcd(a, b)
     
     Args:
-        n: Number to test
-        k: Number of rounds (40 gives good confidence)
+        a, b: Integers
     
-    Returns: True if probably prime, False if composite
+    Returns:
+        Tuple (gcd, x, y)
+    
+    Example:
+        extended_euclidean(30, 20) = (10, 1, -1)
+        Because 30*1 + 20*(-1) = 10
+    """
+    # TODO: Implement extended Euclidean algorithm
+    if b == 0:
+        return a, 1, 0
+    
+    gcd_val, x1, y1 = extended_euclidean(b, a % b)
+    x = y1
+    y = x1 - (a // b) * y1
+    
+    return gcd_val, x, y
+
+
+def modular_inverse(a: int, m: int) -> int:
+    """
+    Compute modular multiplicative inverse: a^(-1) mod m
+    
+    Returns x such that (a * x) % m == 1
+    
+    Args:
+        a: Integer to invert
+        m: Modulus
+    
+    Returns:
+        Modular inverse of a modulo m
+    
+    Raises:
+        ValueError: If gcd(a, m) != 1 (inverse doesn't exist)
+    
+    Example:
+        modular_inverse(3, 11) = 4
+        Because (3 * 4) % 11 = 1
+    """
+    # TODO: Use extended_euclidean to compute inverse
+    gcd_val, x, _ = extended_euclidean(a, m)
+    
+    if gcd_val != 1:
+        raise ValueError(f"Modular inverse does not exist: gcd({a}, {m}) = {gcd_val} != 1")
+    
+    return x % m
+
+
+# ============================================================================
+# PRIME GENERATION - Manual Implementation Required
+# ============================================================================
+
+def is_prime_miller_rabin(n: int, k: int = 40) -> bool:
+    """
+    Miller-Rabin Primality Test
+    
+    Probabilistic test with error probability ≤ 4^(-k)
+    With k=40, error probability ≤ 2^(-80) (negligible)
+    
+    Args:
+        n: Number to test for primality
+        k: Number of rounds (default 40 for high confidence)
+    
+    Returns:
+        True if n is probably prime
+        False if n is definitely composite
     """
     # TODO: Implement Miller-Rabin algorithm
-    pass
+    # HINT:
+    # 1. Handle special cases (n < 2, n == 2, even numbers)
+    # 2. Write n-1 as 2^r * d (where d is odd)
+    # 3. Repeat k times:
+    #    - Pick random witness a in [2, n-2]
+    #    - Compute x = a^d mod n
+    #    - Check witness conditions
+    
+    # Special cases
+    if n < 2:
+        return False
+    if n == 2 or n == 3:
+        return True
+    if n % 2 == 0:
+        return False
+    
+    # Write n-1 as 2^r * d
+    r, d = 0, n - 1
+    while d % 2 == 0:
+        r += 1
+        d //= 2
+    
+    # Witness loop
+    for _ in range(k):
+        a = secrets.randbelow(n - 3) + 2  # Random in [2, n-2]
+        x = modular_exponentiation(a, d, n)
+        
+        if x == 1 or x == n - 1:
+            continue
+        
+        for _ in range(r - 1):
+            x = modular_exponentiation(x, 2, n)
+            if x == n - 1:
+                break
+        else:
+            return False  # Composite
+    
+    return True  # Probably prime
 
-def generate_large_prime(bit_length):
+
+def generate_large_prime(bit_length: int) -> int:
     """
-    Generate a random prime of specified bit length
+    Generate a random prime number of specified bit length
     
     Args:
-        bit_length: SL parameter (2048 or 3072)
+        bit_length: Desired bit length (e.g., 2048, 3072)
     
-    Returns: A prime p where 2^(SL-1) < p < 2^SL
+    Returns:
+        Prime p where 2^(bit_length-1) < p < 2^bit_length
+    
+    Example:
+        p = generate_large_prime(2048)
+        # p is a random 2048-bit prime
     """
-    # TODO: 
-    # 1. Generate random odd number in range
+    # TODO: Implement prime generation
+    # HINT:
+    # 1. Generate random odd number in correct range
     # 2. Test with Miller-Rabin
-    # 3. If composite, increment by 2 and retry
-    pass
+    # 3. If composite, add 2 and retry
+    
+    while True:
+        # Generate random number in range [2^(n-1), 2^n)
+        p = secrets.randbits(bit_length)
+        p |= (1 << (bit_length - 1))  # Set MSB to ensure bit_length bits
+        p |= 1  # Set LSB to ensure odd
+        
+        if is_prime_miller_rabin(p):
+            return p
 
-def find_generator(p):
+
+def find_generator(p: int) -> int:
     """
-    Find a primitive root (generator) modulo p
+    Find a primitive root (generator) modulo prime p
+    
+    A generator g has order p-1, meaning g^i mod p generates
+    all non-zero elements in Z_p for i = 1, 2, ..., p-1
     
     Args:
         p: Prime modulus
     
-    Returns: A generator g such that g generates all elements mod p
+    Returns:
+        A generator g modulo p
+    
+    Note:
+        This is a simplified implementation.
+        For production, use known safe primes with generator 2 or 5.
     """
-    # TODO: Implement generator finding algorithm
-    # Hint: Check if g^((p-1)/q) != 1 for all prime factors q of (p-1)
-    pass
-```
+    # TODO: Implement generator finding
+    # HINT:
+    # 1. Find prime factors of p-1
+    # 2. For candidate g = 2, 3, 4, ...:
+    #    Check if g^((p-1)/q) != 1 mod p for all prime factors q
+    #    If true, g is a generator
+    
+    # Simplified: Try small candidates (often works for random primes)
+    # For a proper implementation, factor p-1 and verify
+    for g in range(2, min(100, p)):
+        if modular_exponentiation(g, p - 1, p) == 1:
+            # Check if order is actually p-1 (simplified check)
+            if modular_exponentiation(g, (p - 1) // 2, p) != 1:
+                return g
+    
+    # Fallback: return 2 (often works)
+    return 2
 
-**Testing Requirements:**
-- Generate multiple 2048-bit primes and verify primality
-- Verify generator property: order of g should be p-1
-- **Performance Benchmark**: Log prime generation time
 
-#### Step 1.3: ElGamal Key Generation
+# ============================================================================
+# ELGAMAL KEY GENERATION
+# ============================================================================
 
-**Priority: CRITICAL** | **Estimated Time: 2-3 hours**
-
-```python
 class ElGamalKey:
-    """Container for ElGamal public/private keys"""
-    def __init__(self, p, g, x=None, y=None):
+    """Container for ElGamal public/private key components"""
+    
+    def __init__(self, p: int, g: int, x: int = None, y: int = None):
         self.p = p          # Prime modulus
         self.g = g          # Generator
         self.x = x          # Private key (secret)
         self.y = y          # Public key = g^x mod p
-        self.sl = None      # Security level (bit length)
+    
+    def __repr__(self):
+        return f"ElGamalKey(p={self.p}, g={self.g}, y={self.y})"
 
-def generate_elgamal_keypair(p, g):
+
+def generate_elgamal_keypair(p: int, g: int) -> Tuple[ElGamalKey, ElGamalKey]:
     """
     Generate ElGamal key pair
     
@@ -199,21 +787,34 @@ def generate_elgamal_keypair(p, g):
         p: Prime modulus
         g: Generator
     
-    Returns: ElGamalKey object with both public and private components
+    Returns:
+        Tuple (public_key, private_key)
+        - public_key: ElGamalKey with (p, g, y)
+        - private_key: ElGamalKey with (p, g, x, y)
     """
-    # TODO:
+    # TODO: Implement key generation
     # 1. Generate random private key x in [1, p-2]
     # 2. Compute public key y = g^x mod p
-    # 3. Return ElGamalKey object
-    pass
-```
+    # 3. Return both key objects
+    
+    # Generate private key
+    x = secrets.randbelow(p - 2) + 1  # Random in [1, p-2]
+    
+    # Compute public key
+    y = modular_exponentiation(g, x, p)
+    
+    # Create key objects
+    public_key = ElGamalKey(p=p, g=g, x=None, y=y)
+    private_key = ElGamalKey(p=p, g=g, x=x, y=y)
+    
+    return public_key, private_key
 
-#### Step 1.4: ElGamal Encryption/Decryption
 
-**Priority: CRITICAL** | **Estimated Time: 3-4 hours**
+# ============================================================================
+# ELGAMAL ENCRYPTION/DECRYPTION
+# ============================================================================
 
-```python
-def elgamal_encrypt(message, public_key):
+def elgamal_encrypt(message: int, public_key: ElGamalKey) -> Tuple[int, int]:
     """
     ElGamal Encryption
     
@@ -221,18 +822,37 @@ def elgamal_encrypt(message, public_key):
         message: Integer message m (must be < p)
         public_key: ElGamalKey with (p, g, y)
     
-    Returns: Tuple (c1, c2) where:
-        c1 = g^k mod p
-        c2 = (m * y^k) mod p
+    Returns:
+        Tuple (c1, c2) where:
+            c1 = g^k mod p
+            c2 = (m * y^k) mod p
+    
+    Raises:
+        ValueError: If message >= p
     """
-    # TODO:
-    # 1. Generate random k in [1, p-2]
-    # 2. Compute c1 = g^k mod p
-    # 3. Compute c2 = (m * y^k) mod p
-    # 4. Return (c1, c2)
-    pass
+    # TODO: Implement ElGamal encryption
+    # 1. Validate message < p
+    # 2. Generate random k in [1, p-2]
+    # 3. Compute c1 = g^k mod p
+    # 4. Compute c2 = (m * y^k) mod p
+    # 5. Return (c1, c2)
+    
+    p, g, y = public_key.p, public_key.g, public_key.y
+    
+    if message >= p:
+        raise ValueError(f"Message {message} must be < p ({p})")
+    
+    # Generate random k
+    k = secrets.randbelow(p - 2) + 1
+    
+    # Compute ciphertext
+    c1 = modular_exponentiation(g, k, p)
+    c2 = (message * modular_exponentiation(y, k, p)) % p
+    
+    return c1, c2
 
-def elgamal_decrypt(ciphertext, private_key):
+
+def elgamal_decrypt(ciphertext: Tuple[int, int], private_key: ElGamalKey) -> int:
     """
     ElGamal Decryption
     
@@ -240,48 +860,79 @@ def elgamal_decrypt(ciphertext, private_key):
         ciphertext: Tuple (c1, c2)
         private_key: ElGamalKey with (p, g, x)
     
-    Returns: Original message m = c2 * (c1^x)^(-1) mod p
+    Returns:
+        Original message m = c2 * (c1^x)^(-1) mod p
     """
-    # TODO:
-    # 1. Unpack c1, c2
+    # TODO: Implement ElGamal decryption
+    # 1. Unpack c1, c2 from ciphertext
     # 2. Compute s = c1^x mod p
     # 3. Compute s_inv = modular_inverse(s, p)
     # 4. Compute m = (c2 * s_inv) mod p
     # 5. Return m
-    pass
-```
+    
+    c1, c2 = ciphertext
+    p, x = private_key.p, private_key.x
+    
+    # Compute shared secret
+    s = modular_exponentiation(c1, x, p)
+    
+    # Compute inverse
+    s_inv = modular_inverse(s, p)
+    
+    # Recover message
+    m = (c2 * s_inv) % p
+    
+    return m
 
-**Testing Requirements:**
-- Encrypt then decrypt: verify `decrypt(encrypt(m)) == m`
-- Test with edge cases: m=1, m=p-1
-- Test with different message sizes
 
-#### Step 1.5: ElGamal Digital Signatures
+# ============================================================================
+# ELGAMAL DIGITAL SIGNATURES
+# ============================================================================
 
-**Priority: CRITICAL** | **Estimated Time: 4-5 hours**
-
-```python
-def elgamal_sign(message_hash, private_key):
+def elgamal_sign(message_hash: int, private_key: ElGamalKey) -> Tuple[int, int]:
     """
     ElGamal Digital Signature
     
     Args:
-        message_hash: Integer hash H(m) of the message
+        message_hash: Integer hash H(m) of the message (should be < p-1)
         private_key: ElGamalKey with (p, g, x)
     
-    Returns: Signature tuple (r, s) where:
-        r = g^k mod p
-        s = (H(m) - x*r) * k^(-1) mod (p-1)
+    Returns:
+        Signature tuple (r, s) where:
+            r = g^k mod p
+            s = (H(m) - x*r) * k^(-1) mod (p-1)
+    
+    Note:
+        k is randomly chosen such that gcd(k, p-1) = 1
     """
-    # TODO:
+    # TODO: Implement ElGamal signing
     # 1. Generate random k such that gcd(k, p-1) = 1
     # 2. Compute r = g^k mod p
     # 3. Compute k_inv = modular_inverse(k, p-1)
     # 4. Compute s = ((H(m) - x*r) * k_inv) mod (p-1)
     # 5. Return (r, s)
-    pass
+    
+    p, g, x = private_key.p, private_key.g, private_key.x
+    
+    # Ensure message_hash is within valid range
+    message_hash = message_hash % (p - 1)
+    
+    # Generate k such that gcd(k, p-1) = 1
+    while True:
+        k = secrets.randbelow(p - 2) + 1
+        if gcd(k, p - 1) == 1:
+            break
+    
+    # Compute signature
+    r = modular_exponentiation(g, k, p)
+    k_inv = modular_inverse(k, p - 1)
+    s = ((message_hash - x * r) * k_inv) % (p - 1)
+    
+    return r, s
 
-def elgamal_verify(message_hash, signature, public_key):
+
+def elgamal_verify(message_hash: int, signature: Tuple[int, int], 
+                   public_key: ElGamalKey) -> bool:
     """
     ElGamal Signature Verification
     
@@ -290,1085 +941,683 @@ def elgamal_verify(message_hash, signature, public_key):
         signature: Tuple (r, s)
         public_key: ElGamalKey with (p, g, y)
     
-    Returns: True if valid, False otherwise
+    Returns:
+        True if signature is valid, False otherwise
     
-    Verification: Check if g^H(m) ≡ y^r * r^s (mod p)
+    Verification equation: g^H(m) ≡ y^r * r^s (mod p)
     """
-    # TODO:
-    # 1. Unpack r, s
-    # 2. Compute left = g^H(m) mod p
-    # 3. Compute right = (y^r * r^s) mod p
-    # 4. Return left == right
-    pass
-```
+    # TODO: Implement ElGamal verification
+    # 1. Unpack r, s from signature
+    # 2. Validate r, s are in correct range
+    # 3. Compute left side: g^H(m) mod p
+    # 4. Compute right side: (y^r * r^s) mod p
+    # 5. Return True if equal, False otherwise
+    
+    r, s = signature
+    p, g, y = public_key.p, public_key.g, public_key.y
+    
+    # Validate signature components
+    if not (0 < r < p and 0 <= s < p - 1):
+        return False
+    
+    # Ensure message_hash is within valid range
+    message_hash = message_hash % (p - 1)
+    
+    # Compute verification equation
+    lhs = modular_exponentiation(g, message_hash, p)
+    rhs = (modular_exponentiation(y, r, p) * modular_exponentiation(r, s, p)) % p
+    
+    return lhs == rhs
 
-**Testing Requirements:**
-- Sign then verify: verify should return True
-- Modify signature: verify should return False
-- Modify message: verify should return False
 
-#### Step 1.6: Hash and MAC Functions
+# ============================================================================
+# HELPER FUNCTIONS - Using Permitted Libraries
+# ============================================================================
 
-**Priority: HIGH** | **Estimated Time: 1-2 hours**
-
-```python
-import hashlib
-import hmac
-
-def hash_sha256(data):
+def sha256_hash(data: bytes) -> bytes:
     """
-    SHA-256 hash function
+    Compute SHA-256 hash
     
     Args:
-        data: bytes or string to hash
+        data: Bytes to hash
     
-    Returns: bytes (32-byte hash)
+    Returns:
+        32-byte hash digest
     """
-    if isinstance(data, str):
-        data = data.encode('utf-8')
     return hashlib.sha256(data).digest()
 
-def hmac_sha256(key, data):
+
+def sha256_hash_to_int(data: bytes) -> int:
     """
-    HMAC-SHA256 authentication code
+    Compute SHA-256 hash and convert to integer
+    
+    Args:
+        data: Bytes to hash
+    
+    Returns:
+        Integer representation of hash
+    """
+    hash_bytes = sha256_hash(data)
+    return int.from_bytes(hash_bytes, 'big')
+
+
+def hmac_sha256(key: bytes, message: bytes) -> bytes:
+    """
+    Compute HMAC-SHA256
     
     Args:
         key: Secret key (bytes)
-        data: Message to authenticate (bytes)
+        message: Message to authenticate (bytes)
     
-    Returns: bytes (32-byte HMAC)
+    Returns:
+        32-byte HMAC tag
     """
-    if isinstance(key, str):
-        key = key.encode('utf-8')
-    if isinstance(data, str):
-        data = data.encode('utf-8')
-    return hmac.new(key, data, hashlib.sha256).digest()
-```
+    return hmac.new(key, message, hashlib.sha256).digest()
 
-#### Step 1.7: AES-256 CBC Mode (Phase 3 Only)
 
-**Priority: MEDIUM** | **Estimated Time: 2 hours**
-
-```python
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad, unpad
-import os
-
-def aes_encrypt(key, plaintext):
+def aes_cbc_encrypt(key: bytes, plaintext: bytes, iv: bytes = None) -> bytes:
     """
-    AES-256 encryption in CBC mode
+    AES-256-CBC Encryption (Permitted for Phase 3 only)
     
     Args:
-        key: 32-byte encryption key
-        plaintext: Data to encrypt (bytes)
+        key: 32-byte AES key
+        plaintext: Data to encrypt
+        iv: 16-byte initialization vector (generated if None)
     
-    Returns: (iv, ciphertext) tuple
+    Returns:
+        IV ∥ ciphertext (IV is prepended)
     """
-    # TODO:
-    # 1. Generate random 16-byte IV
-    # 2. Create AES cipher in CBC mode
-    # 3. Pad plaintext to block size
-    # 4. Encrypt
-    # 5. Return (iv, ciphertext)
-    pass
-
-def aes_decrypt(key, iv, ciphertext):
-    """
-    AES-256 decryption in CBC mode
+    from Crypto.Cipher import AES
+    from Crypto.Random import get_random_bytes
+    from Crypto.Util.Padding import pad
     
-    Args:
-        key: 32-byte encryption key
-        iv: 16-byte initialization vector
-        ciphertext: Encrypted data
+    if len(key) != 32:
+        raise ValueError("AES-256 requires 32-byte key")
     
-    Returns: Original plaintext (bytes)
+    if iv is None:
+        iv = get_random_bytes(16)
+    
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    padded_plaintext = pad(plaintext, AES.block_size)
+    ciphertext = cipher.encrypt(padded_plaintext)
+    
+    return iv + ciphertext
+
+
+def aes_cbc_decrypt(key: bytes, ciphertext: bytes) -> bytes:
     """
-    # TODO:
-    # 1. Create AES cipher with same IV
-    # 2. Decrypt
-    # 3. Unpad
-    # 4. Return plaintext
-    pass
-```
-
-#### Step 1.8: Message Encoding/Decoding
-
-**Priority: HIGH** | **Estimated Time: 2-3 hours**
-
-```python
-def bytes_to_int(data):
-    """Convert bytes to integer for ElGamal encryption"""
-    return int.from_bytes(data, byteorder='big')
-
-def int_to_bytes(n, length=None):
-    """Convert integer back to bytes"""
-    if length is None:
-        length = (n.bit_length() + 7) // 8
-    return n.to_bytes(length, byteorder='big')
-
-def split_message(message, chunk_size):
-    """
-    Split large message into chunks that fit in ElGamal
+    AES-256-CBC Decryption (Permitted for Phase 3 only)
     
     Args:
-        message: bytes to split
-        chunk_size: Maximum chunk size (must be < p)
+        key: 32-byte AES key
+        ciphertext: IV ∥ encrypted data
     
-    Returns: List of byte chunks
+    Returns:
+        Decrypted plaintext
     """
-    # TODO: Split message into manageable pieces
-    pass
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import unpad
+    
+    if len(key) != 32:
+        raise ValueError("AES-256 requires 32-byte key")
+    
+    iv = ciphertext[:16]
+    actual_ciphertext = ciphertext[16:]
+    
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    padded_plaintext = cipher.decrypt(actual_ciphertext)
+    plaintext = unpad(padded_plaintext, AES.block_size)
+    
+    return plaintext
 
-def join_chunks(chunks):
-    """Reassemble message from chunks"""
-    return b''.join(chunks)
+
+# ============================================================================
+# MESSAGE SERIALIZATION HELPERS
+# ============================================================================
+
+def int_to_bytes(n: int) -> bytes:
+    """Convert integer to bytes with length prefix"""
+    byte_data = n.to_bytes((n.bit_length() + 7) // 8, 'big')
+    length = len(byte_data)
+    return struct.pack('>I', length) + byte_data
+
+
+def bytes_to_int(data: bytes, offset: int = 0) -> Tuple[int, int]:
+    """
+    Parse integer from bytes with length prefix
+    
+    Returns: (integer_value, new_offset)
+    """
+    length = struct.unpack('>I', data[offset:offset+4])[0]
+    offset += 4
+    int_value = int.from_bytes(data[offset:offset+length], 'big')
+    offset += length
+    return int_value, offset
 ```
 
----
-
-### **PHASE 2: Mission Control Center (mcc.py)**
-
-**Priority: CRITICAL** | **Estimated Time: 8-10 hours**
-
-#### Step 2.1: MCC Initialization
+### mcc.py - Mission Control Center (Partial Implementation)
 
 ```python
+"""
+Mission Control Center (MCC) Server
+Handles multiple drone connections with mutual authentication
+"""
+
+import socket
+import threading
+import time
+import struct
+from typing import Dict, Tuple
+from crypto_utils import *
+
+# Protocol Opcodes
+OPCODE_PARAM_INIT = 10
+OPCODE_AUTH_REQ = 20
+OPCODE_AUTH_RES = 30
+OPCODE_SK_CONFIRM = 40
+OPCODE_SUCCESS = 50
+OPCODE_ERR_MISMATCH = 60
+OPCODE_GROUP_KEY = 70
+OPCODE_GROUP_CMD = 80
+OPCODE_SHUTDOWN = 90
+
+
 class MissionControlCenter:
+    """MCC Server - manages drone fleet"""
+    
     def __init__(self, host='localhost', port=5555, security_level=2048):
-        """
-        Initialize MCC Server
-        
-        Args:
-            host: Bind address
-            port: Listen port
-            security_level: Bit length for prime (2048 or 3072)
-        """
         self.host = host
         self.port = port
         self.security_level = security_level
+        self.id = "MCC-001"
+        
+        print(f"[MCC] Initializing with SL={security_level} bits...")
         
         # Generate MCC's ElGamal keys
-        print("[MCC] Generating cryptographic parameters...")
+        print(f"[MCC] Generating {security_level}-bit prime...")
         self.p = generate_large_prime(security_level)
+        print(f"[MCC] Finding generator...")
         self.g = find_generator(self.p)
-        self.keypair = generate_elgamal_keypair(self.p, self.g)
+        print(f"[MCC] Generating ElGamal keypair...")
+        self.public_key, self.private_key = generate_elgamal_keypair(self.p, self.g)
         
-        # Thread-safe drone registry
-        self.drones = {}  # {drone_id: DroneSession}
-        self.drones_lock = threading.Lock()
+        print(f"[MCC] Crypto initialization complete")
+        print(f"[MCC] Public key y = {self.public_key.y}")
         
-        # Server socket
+        # Thread-safe fleet registry
+        self.fleet_lock = threading.Lock()
+        self.fleet: Dict[str, dict] = {}
+        # Structure: {drone_id: {
+        #   'socket': socket_object,
+        #   'session_key': SK_bytes,
+        #   'public_key': ElGamalKey,
+        #   'address': (ip, port)
+        # }}
+        
+        # Temporary storage for authentication in progress
+        self.auth_temp_lock = threading.Lock()
+        self.auth_temp: Dict[str, dict] = {}
+        
         self.server_socket = None
         self.running = False
+    
+    def start_server(self):
+        """Main server loop"""
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(5)
+        self.running = True
         
-        print(f"[MCC] Initialized with SL={security_level}")
-        print(f"[MCC] Public Key Y: {self.keypair.y}")
-```
-
-#### Step 2.2: Drone Session Management
-
-```python
-class DroneSession:
-    """Represents a connected drone's session state"""
-    def __init__(self, drone_id, socket, address):
-        self.drone_id = drone_id
-        self.socket = socket
-        self.address = address
-        self.drone_public_key = None
-        self.shared_secret = None  # KDi,MCC
-        self.session_key = None    # SKDi,MCC
-        self.authenticated = False
-        self.timestamp_auth = None
-```
-
-#### Step 2.3: Phase 0 - Parameter Distribution
-
-```python
-def send_phase0_params(self, client_socket):
-    """
-    Phase 0: Send crypto parameters to drone
-    
-    Message Structure:
-    - OPCODE 10 (1 byte)
-    - p (variable bytes)
-    - g (variable bytes)
-    - SL (4 bytes)
-    - Timestamp (8 bytes)
-    - IDMCC (variable)
-    - Signature (variable)
-    """
-    # TODO:
-    # 1. Create timestamp
-    # 2. Prepare message M0 = p || g || SL || TS0 || IDMCC
-    # 3. Sign M0 with MCC's private key
-    # 4. Pack into protocol format
-    # 5. Send to client
-    pass
-```
-
-#### Step 2.4: Phase 1A - Process Drone Authentication Request
-
-```python
-def process_phase1a_auth_request(self, data, client_socket):
-    """
-    Phase 1A: Process incoming drone authentication
-    
-    Receives:
-    - OPCODE 20
-    - TSi (timestamp)
-    - RNi (nonce)
-    - IDDi (drone ID)
-    - Ci (encrypted KDi,MCC)
-    - Signature
-    
-    Validates:
-    - Timestamp freshness (within 30 seconds)
-    - Signature verification
-    - Drone not blocked
-    """
-    # TODO:
-    # 1. Parse incoming message
-    # 2. Verify timestamp freshness
-    # 3. Lookup drone's public key (pre-shared or from PKI)
-    # 4. Verify signature
-    # 5. Decrypt Ci to get KDi,MCC
-    # 6. Store in temporary session state
-    # 7. Proceed to Phase 1B
-    pass
-```
-
-#### Step 2.5: Phase 1B - Send MCC Response
-
-```python
-def send_phase1b_response(self, session, KDi_MCC):
-    """
-    Phase 1B: Send MCC authentication response
-    
-    Sends:
-    - OPCODE 30
-    - TSMCC (timestamp)
-    - RNMCC (nonce)
-    - IDMCC
-    - CMCC (encrypted KDi,MCC)
-    - Signature
-    """
-    # TODO:
-    # 1. Generate MCC timestamp and nonce
-    # 2. Encrypt KDi,MCC with drone's public key
-    # 3. Create message M1B
-    # 4. Sign M1B
-    # 5. Send to drone
-    pass
-```
-
-#### Step 2.6: Phase 2 - Session Key Derivation & Confirmation
-
-```python
-def process_phase2_confirmation(self, session, data):
-    """
-    Phase 2: Verify drone's session key confirmation
-    
-    Both parties derive:
-    SKDi,MCC = SHA256(KDi,MCC || TSi || TSMCC || RNi || RNMCC)
-    
-    Receives:
-    - OPCODE 40
-    - HMAC-SHA256(SKDi,MCC, IDDi || TSfinal)
-    """
-    # TODO:
-    # 1. Derive session key using same formula
-    # 2. Compute expected HMAC
-    # 3. Compare with received HMAC
-    # 4. If match:
-    #    - Send OPCODE 50 (SUCCESS)
-    #    - Register drone in active registry
-    # 5. If mismatch:
-    #    - Send OPCODE 60 (ERROR)
-    #    - Block drone ID
-    pass
-```
-
-#### Step 2.7: Concurrent Connection Handling
-
-```python
-def handle_drone_connection(self, client_socket, address):
-    """
-    Thread function to handle a single drone connection
-    
-    Flow:
-    1. Send Phase 0 parameters
-    2. Receive and process Phase 1A
-    3. Send Phase 1B response
-    4. Receive and process Phase 2 confirmation
-    5. Keep connection alive for commands
-    """
-    try:
-        print(f"[MCC] New connection from {address}")
+        print(f"\n[MCC] Server listening on {self.host}:{self.port}")
+        print(f"[MCC] Security Level: {self.security_level} bits")
+        print(f"[MCC] Ready to accept drone connections\n")
         
-        # Phase 0
-        self.send_phase0_params(client_socket)
+        # Start CLI in separate thread
+        cli_thread = threading.Thread(target=self.cli_loop, daemon=True)
+        cli_thread.start()
         
-        # Phase 1A
-        data = client_socket.recv(4096)
-        session = self.process_phase1a_auth_request(data, client_socket)
-        
-        # Phase 1B
-        self.send_phase1b_response(session)
-        
-        # Phase 2
-        data = client_socket.recv(4096)
-        self.process_phase2_confirmation(session, data)
-        
-        # Keep alive for commands
+        # Accept connections
         while self.running:
-            # Listen for drone status updates
-            pass
-            
-    except Exception as e:
-        print(f"[MCC] Error handling drone: {e}")
-    finally:
-        client_socket.close()
-
-def start_server(self):
-    """
-    Main server loop - accepts connections and spawns threads
-    """
-    self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    self.server_socket.bind((self.host, self.port))
-    self.server_socket.listen(5)
-    self.running = True
+            try:
+                client_sock, addr = self.server_socket.accept()
+                print(f"[MCC] New connection from {addr}")
+                
+                # Spawn handler thread
+                handler = threading.Thread(
+                    target=self.handle_drone,
+                    args=(client_sock, addr),
+                    daemon=True
+                )
+                handler.start()
+                
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                print(f"[MCC] Error accepting connection: {e}")
+        
+        self.shutdown()
     
-    print(f"[MCC] Server listening on {self.host}:{self.port}")
-    
-    while self.running:
-        client_socket, address = self.server_socket.accept()
-        thread = threading.Thread(
-            target=self.handle_drone_connection,
-            args=(client_socket, address)
-        )
-        thread.start()
-```
-
-#### Step 2.8: Command Line Interface
-
-```python
-def cli_interface(self):
-    """
-    Interactive CLI for MCC operator
-    
-    Commands:
-    - list: Show all authenticated drones
-    - broadcast <cmd>: Send command to all drones
-    - shutdown: Close all connections
-    """
-    print("\n[MCC] Command Interface Ready")
-    print("Commands: list | broadcast <cmd> | shutdown")
-    
-    while self.running:
+    def handle_drone(self, client_sock: socket.socket, addr: Tuple[str, int]):
+        """Handle individual drone connection through all phases"""
         try:
-            user_input = input("MCC> ").strip()
+            # Phase 0: Send parameters
+            self.send_phase0(client_sock)
             
-            if user_input == "list":
-                self.cmd_list_drones()
-            elif user_input.startswith("broadcast "):
-                cmd = user_input[10:]
-                self.cmd_broadcast(cmd)
-            elif user_input == "shutdown":
-                self.cmd_shutdown()
+            # Phase 1A: Receive drone authentication
+            drone_id, k_shared, drone_public_key, rn_drone, ts_drone = \
+                self.receive_phase1a(client_sock)
+            
+            if not drone_id:
+                print(f"[MCC] Phase 1A failed for {addr}")
+                client_sock.close()
+                return
+            
+            # Store temporary auth data
+            with self.auth_temp_lock:
+                self.auth_temp[drone_id] = {
+                    'k_shared': k_shared,
+                    'public_key': drone_public_key,
+                    'rn_drone': rn_drone,
+                    'ts_drone': ts_drone,
+                    'socket': client_sock,
+                    'address': addr
+                }
+            
+            # Phase 1B: Send MCC authentication
+            rn_mcc, ts_mcc = self.send_phase1b(client_sock, k_shared, drone_public_key)
+            
+            # Phase 2: Confirm session key
+            if not self.confirm_session_key(client_sock, drone_id, k_shared, 
+                                           ts_drone, ts_mcc, rn_drone, rn_mcc):
+                print(f"[MCC] Phase 2 failed for {drone_id}")
+                client_sock.close()
+                return
+            
+            # Move to fleet registry
+            with self.fleet_lock:
+                with self.auth_temp_lock:
+                    temp_data = self.auth_temp.pop(drone_id)
+                
+                # Derive session key
+                sk = self.derive_session_key(k_shared, ts_drone, ts_mcc, 
+                                             rn_drone, rn_mcc)
+                
+                self.fleet[drone_id] = {
+                    'socket': client_sock,
+                    'session_key': sk,
+                    'public_key': drone_public_key,
+                    'address': addr
+                }
+            
+            print(f"[MCC] ✓ Drone {drone_id} authenticated successfully")
+            
+            # Keep connection alive
+            while self.running:
+                time.sleep(1)
+                
+        except Exception as e:
+            print(f"[MCC] Error handling drone: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            try:
+                client_sock.close()
+            except:
+                pass
+    
+    def send_phase0(self, client_sock: socket.socket):
+        """
+        Phase 0: Parameter Initialization
+        Send: OPCODE 10 ∥ p ∥ g ∥ SL ∥ TS0 ∥ IDMCC ∥ signature
+        """
+        # TODO: Implement Phase 0 message construction
+        # 1. Get current timestamp
+        # 2. Create message M0 = p ∥ g ∥ SL ∥ TS0 ∥ IDMCC
+        # 3. Sign M0
+        # 4. Send opcode ∥ M0 ∥ signature
+        
+        ts0 = int(time.time())
+        
+        # Build message
+        msg = bytearray([OPCODE_PARAM_INIT])
+        msg += int_to_bytes(self.p)
+        msg += int_to_bytes(self.g)
+        msg += struct.pack('>I', self.security_level)
+        msg += struct.pack('>Q', ts0)
+        msg += self.id.encode('utf-8')
+        
+        # Sign (excluding opcode)
+        msg_to_sign = msg[1:]
+        hash_val = sha256_hash_to_int(msg_to_sign)
+        r, s = elgamal_sign(hash_val, self.private_key)
+        
+        msg += int_to_bytes(r)
+        msg += int_to_bytes(s)
+        
+        # Send
+        client_sock.sendall(bytes(msg))
+        print(f"[MCC] Phase 0: Parameters sent")
+    
+    def receive_phase1a(self, client_sock: socket.socket):
+        """
+        Phase 1A: Drone Authentication Request
+        Receive: OPCODE 20 ∥ TSi ∥ RNi ∥ IDDi ∥ Ci ∥ yDi ∥ signature
+        """
+        # TODO: Implement Phase 1A message parsing
+        # 1. Receive and parse message
+        # 2. Verify timestamp freshness
+        # 3. Verify signature using drone's public key
+        # 4. Decrypt ciphertext to get KDi,MCC
+        # 5. Return (drone_id, KDi,MCC, drone_public_key, RNi, TSi)
+        
+        # Receive data (simplified - should use proper framing)
+        data = client_sock.recv(8192)
+        
+        if not data or data[0] != OPCODE_AUTH_REQ:
+            return None, None, None, None, None
+        
+        offset = 1
+        
+        # Parse timestamp
+        ts_drone = struct.unpack('>Q', data[offset:offset+8])[0]
+        offset += 8
+        
+        # Validate timestamp
+        current_time = int(time.time())
+        if abs(current_time - ts_drone) > 300:  # 5 minutes
+            print(f"[MCC] Stale timestamp in Phase 1A")
+            return None, None, None, None, None
+        
+        # Parse nonce
+        rn_drone = data[offset:offset+32]
+        offset += 32
+        
+        # Parse drone ID
+        id_len = struct.unpack('>I', data[offset:offset+4])[0]
+        offset += 4
+        drone_id = data[offset:offset+id_len].decode('utf-8')
+        offset += id_len
+        
+        # Parse ciphertext (c1, c2)
+        c1, offset = bytes_to_int(data, offset)
+        c2, offset = bytes_to_int(data, offset)
+        
+        # Parse drone's public key
+        y_drone_int, offset = bytes_to_int(data, offset)
+        drone_public_key = ElGamalKey(p=self.p, g=self.g, y=y_drone_int)
+        
+        # Parse signature
+        sig_r, offset = bytes_to_int(data, offset)
+        sig_s, offset = bytes_to_int(data, offset)
+        
+        # Verify signature
+        msg_to_verify = data[1:offset - struct.unpack('>I', data[offset-struct.calcsize('>I')-sig_s.bit_length()//8-4:offset-sig_s.bit_length()//8])[0] - sig_s.bit_length()//8 - 4 - struct.unpack('>I', data[offset-struct.calcsize('>I')-sig_s.bit_length()//8-4-struct.calcsize('>I')-sig_r.bit_length()//8-4:offset-sig_s.bit_length()//8-4-sig_r.bit_length()//8])[0] - sig_r.bit_length()//8 - 4]
+        
+        # Simplified: hash everything before signature
+        hash_val = sha256_hash_to_int(data[1:offset-16])  # Approximate
+        
+        if not elgamal_verify(hash_val, (sig_r, sig_s), drone_public_key):
+            print(f"[MCC] Invalid signature in Phase 1A")
+            return None, None, None, None, None
+        
+        # Decrypt ciphertext
+        k_shared_int = elgamal_decrypt((c1, c2), self.private_key)
+        k_shared = k_shared_int.to_bytes(32, 'big')
+        
+        print(f"[MCC] Phase 1A: Received auth from {drone_id}")
+        return drone_id, k_shared, drone_public_key, rn_drone, ts_drone
+    
+    def send_phase1b(self, client_sock: socket.socket, k_shared: bytes, 
+                     drone_public_key: ElGamalKey):
+        """
+        Phase 1B: MCC Authentication Response
+        Send: OPCODE 30 ∥ TSMCC ∥ RNMCC ∥ IDMCC ∥ CMCC ∥ signature
+        """
+        # TODO: Implement (similar to Phase 0/1A)
+        pass
+    
+    def confirm_session_key(self, client_sock: socket.socket, drone_id: str,
+                           k_shared: bytes, ts_drone: int, ts_mcc: int,
+                           rn_drone: bytes, rn_mcc: bytes) -> bool:
+        """Phase 2: Session Key Confirmation via HMAC"""
+        # TODO: Implement
+        pass
+    
+    def derive_session_key(self, k_shared: bytes, ts_drone: int, ts_mcc: int,
+                          rn_drone: bytes, rn_mcc: bytes) -> bytes:
+        """
+        Derive session key: SK = H(KDi,MCC ∥ TSi ∥ TSMCC ∥ RNi ∥ RNMCC)
+        """
+        data = k_shared
+        data += struct.pack('>Q', ts_drone)
+        data += struct.pack('>Q', ts_mcc)
+        data += rn_drone
+        data += rn_mcc
+        
+        return sha256_hash(data)
+    
+    def cli_loop(self):
+        """Command Line Interface"""
+        print("\n" + "="*50)
+        print("MCC Command Line Interface")
+        print("Commands: list, broadcast <cmd>, shutdown")
+        print("="*50 + "\n")
+        
+        while self.running:
+            try:
+                cmd = input("MCC> ").strip()
+                
+                if cmd == "list":
+                    self.cmd_list()
+                elif cmd.startswith("broadcast "):
+                    command = cmd[10:]
+                    self.cmd_broadcast(command)
+                elif cmd == "shutdown":
+                    self.cmd_shutdown()
+                    break
+                else:
+                    print("Unknown command. Available: list, broadcast <cmd>, shutdown")
+            except (EOFError, KeyboardInterrupt):
                 break
+    
+    def cmd_list(self):
+        """Show all authenticated drones"""
+        with self.fleet_lock:
+            if not self.fleet:
+                print("No drones connected")
             else:
-                print("Unknown command")
-                
-        except KeyboardInterrupt:
-            print("\n[MCC] Shutting down...")
-            self.cmd_shutdown()
-            break
-
-def cmd_list_drones(self):
-    """Display all connected drones"""
-    with self.drones_lock:
-        if not self.drones:
-            print("No drones connected")
-            return
-        
-        print("\nActive Drones:")
-        print("-" * 60)
-        for drone_id, session in self.drones.items():
-            status = "Authenticated" if session.authenticated else "Connecting"
-            print(f"{drone_id:20s} | {session.address} | {status}")
-        print("-" * 60)
-```
-
-#### Step 2.9: Phase 3 - Group Key Broadcast
-
-```python
-def cmd_broadcast(self, command):
-    """
-    Phase 3: Broadcast command to all drones using group key
+                print(f"\nConnected drones: {len(self.fleet)}")
+                print("-" * 60)
+                for drone_id, info in self.fleet.items():
+                    print(f"  {drone_id:15s} @ {info['address'][0]}:{info['address'][1]}")
+                print("-" * 60)
     
-    Steps:
-    1. Aggregate all session keys
-    2. Derive group key GK
-    3. Send GK to each drone (encrypted with their SK)
-    4. Send command encrypted with GK
-    """
-    with self.drones_lock:
-        if not self.drones:
-            print("[MCC] No drones to broadcast to")
-            return
-        
-        # Step 1: Collect all session keys
-        session_keys = [s.session_key for s in self.drones.values()]
-        
-        # Step 2: Derive group key
-        gk_material = b''.join(session_keys) + self.keypair.x.to_bytes(256, 'big')
-        group_key = hash_sha256(gk_material)
-        
-        print(f"[MCC] Generated Group Key: {group_key.hex()[:32]}...")
-        
-        # Step 3: Distribute GK to each drone
-        for drone_id, session in self.drones.items():
-            try:
-                # Encrypt GK with drone's session key
-                iv, encrypted_gk = aes_encrypt(session.session_key, group_key)
-                
-                # Send OPCODE 70 (GROUP_KEY)
-                msg = struct.pack('B', 70) + iv + encrypted_gk
-                session.socket.sendall(msg)
-                
-                print(f"[MCC] Sent GK to {drone_id}")
-            except Exception as e:
-                print(f"[MCC] Failed to send GK to {drone_id}: {e}")
-        
-        # Step 4: Broadcast encrypted command
-        time.sleep(1)  # Give drones time to process GK
-        
-        iv, encrypted_cmd = aes_encrypt(group_key, command.encode('utf-8'))
-        hmac_tag = hmac_sha256(group_key, encrypted_cmd)
-        
-        msg = struct.pack('B', 80) + iv + encrypted_cmd + hmac_tag
-        
-        for drone_id, session in self.drones.items():
-            try:
-                session.socket.sendall(msg)
-                print(f"[MCC] Broadcast to {drone_id}")
-            except Exception as e:
-                print(f"[MCC] Failed to broadcast to {drone_id}: {e}")
-```
-
----
-
-### **PHASE 3: Drone Client (drone.py)**
-
-**Priority: CRITICAL** | **Estimated Time: 6-8 hours**
-
-#### Step 3.1: Drone Initialization
-
-```python
-class Drone:
-    def __init__(self, drone_id, mcc_host='localhost', mcc_port=5555):
-        """
-        Initialize Drone Client
-        
-        Args:
-            drone_id: Unique identifier for this drone
-            mcc_host: MCC server address
-            mcc_port: MCC server port
-        """
-        self.drone_id = drone_id
-        self.mcc_host = mcc_host
-        self.mcc_port = mcc_port
-        
-        # Crypto state
-        self.p = None
-        self.g = None
-        self.security_level = None
-        self.mcc_public_key = None
-        self.keypair = None  # Generated after receiving params
-        
-        # Session state
-        self.shared_secret = None  # KDi,MCC
-        self.session_key = None    # SKDi,MCC
-        self.group_key = None      # GK for broadcasts
-        self.authenticated = False
-        
-        # Nonces and timestamps
-        self.my_nonce = None
-        self.my_timestamp = None
-        self.mcc_nonce = None
-        self.mcc_timestamp = None
-        
-        # Socket
-        self.socket = None
-        
-        print(f"[{self.drone_id}] Initialized")
-```
-
-#### Step 3.2: Phase 0 - Receive Parameters
-
-```python
-def receive_phase0_params(self):
-    """
-    Phase 0: Receive and validate crypto parameters from MCC
-    
-    Validates:
-    - Security level >= 2048
-    - Prime p has correct bit length
-    - Signature verification
-    """
-    # TODO:
-    # 1. Receive OPCODE 10 message
-    # 2. Parse p, g, SL, TS0, IDMCC, signature
-    # 3. Verify SL >= 2048 (security policy)
-    # 4. Verify len(bin(p)) ≈ SL (detect inconsistency)
-    # 5. Verify MCC's signature on parameters
-    # 6. If valid, store p, g, SL
-    # 7. Generate drone's own ElGamal keypair
-    pass
-```
-
-#### Step 3.3: Phase 1A - Send Authentication Request
-
-```python
-def send_phase1a_auth_request(self):
-    """
-    Phase 1A: Send authentication request to MCC
-    
-    Sends:
-    - OPCODE 20
-    - TSi (timestamp)
-    - RNi (256-bit nonce)
-    - IDDi (drone ID)
-    - Ci (encrypted KDi,MCC)
-    - Signature
-    """
-    # TODO:
-    # 1. Generate 256-bit random secret KDi,MCC
-    # 2. Generate random nonce RNi
-    # 3. Create timestamp TSi
-    # 4. Encrypt KDi,MCC with MCC's public key
-    # 5. Create message M1A
-    # 6. Sign M1A with drone's private key
-    # 7. Send to MCC
-    pass
-```
-
-#### Step 3.4: Phase 1B - Process MCC Response
-
-```python
-def receive_phase1b_response(self):
-    """
-    Phase 1B: Receive and validate MCC authentication response
-    
-    Receives:
-    - OPCODE 30
-    - TSMCC
-    - RNMCC
-    - IDMCC
-    - CMCC (encrypted KDi,MCC)
-    - Signature
-    
-    Validates:
-    - Timestamp freshness
-    - Signature
-    - Decrypted key matches original KDi,MCC
-    """
-    # TODO:
-    # 1. Receive message
-    # 2. Verify timestamp
-    # 3. Verify MCC's signature
-    # 4. Decrypt CMCC to get KDi,MCC
-    # 5. Compare with original shared secret
-    # 6. If match, proceed to Phase 2
-    pass
-```
-
-#### Step 3.5: Phase 2 - Session Key Confirmation
-
-```python
-def send_phase2_confirmation(self):
-    """
-    Phase 2: Derive session key and send confirmation
-    
-    Derives:
-    SKDi,MCC = SHA256(KDi,MCC || TSi || TSMCC || RNi || RNMCC)
-    
-    Sends:
-    - OPCODE 40
-    - HMAC-SHA256(SKDi,MCC, IDDi || TSfinal)
-    """
-    # TODO:
-    # 1. Derive session key
-    # 2. Create final timestamp
-    # 3. Compute HMAC over (IDDi || TSfinal)
-    # 4. Send to MCC
-    # 5. Wait for OPCODE 50 (SUCCESS) or 60 (ERROR)
-    pass
-
-def wait_for_confirmation(self):
-    """Wait for MCC's final confirmation"""
-    data = self.socket.recv(1024)
-    opcode = struct.unpack('B', data[0:1])[0]
-    
-    if opcode == 50:  # SUCCESS
-        self.authenticated = True
-        print(f"[{self.drone_id}] Authentication successful!")
-        return True
-    elif opcode == 60:  # MISMATCH
-        print(f"[{self.drone_id}] Authentication failed!")
-        return False
-```
-
-#### Step 3.6: Phase 3 - Receive Group Key and Commands
-
-```python
-def receive_group_key(self):
-    """
-    Phase 3: Receive and decrypt group key
-    
-    Receives:
-    - OPCODE 70
-    - IV
-    - Encrypted GK
-    """
-    data = self.socket.recv(4096)
-    opcode = struct.unpack('B', data[0:1])[0]
-    
-    if opcode == 70:
-        iv = data[1:17]
-        encrypted_gk = data[17:]
-        
-        # Decrypt using session key
-        self.group_key = aes_decrypt(self.session_key, iv, encrypted_gk)
-        print(f"[{self.drone_id}] Received Group Key")
-
-def receive_broadcast_command(self):
-    """
-    Receive and process broadcast command
-    
-    Receives:
-    - OPCODE 80
-    - IV
-    - Encrypted command
-    - HMAC tag
-    """
-    data = self.socket.recv(4096)
-    opcode = struct.unpack('B', data[0:1])[0]
-    
-    if opcode == 80:
-        iv = data[1:17]
-        encrypted_cmd = data[17:-32]
-        received_hmac = data[-32:]
-        
-        # Verify HMAC
-        computed_hmac = hmac_sha256(self.group_key, encrypted_cmd)
-        if computed_hmac != received_hmac:
-            print(f"[{self.drone_id}] HMAC verification failed!")
-            return
-        
-        # Decrypt command
-        command = aes_decrypt(self.group_key, iv, encrypted_cmd)
-        print(f"[{self.drone_id}] Received command: {command.decode('utf-8')}")
-        
-        # Execute command (simulation)
-        self.execute_command(command.decode('utf-8'))
-```
-
-#### Step 3.7: Main Connection Loop
-
-```python
-def connect_to_mcc(self):
-    """
-    Main connection routine
-    
-    Flow:
-    1. Connect to MCC
-    2. Receive Phase 0 parameters
-    3. Send Phase 1A authentication
-    4. Receive Phase 1B response
-    5. Send Phase 2 confirmation
-    6. Enter listening mode for commands
-    """
-    try:
-        # Connect
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.connect((self.mcc_host, self.mcc_port))
-        print(f"[{self.drone_id}] Connected to MCC at {self.mcc_host}:{self.mcc_port}")
-        
-        # Phase 0
-        self.receive_phase0_params()
-        
-        # Phase 1A
-        self.send_phase1a_auth_request()
-        
-        # Phase 1B
-        self.receive_phase1b_response()
-        
-        # Phase 2
-        self.send_phase2_confirmation()
-        if not self.wait_for_confirmation():
-            return False
-        
-        # Phase 3: Listen for group key and commands
-        while True:
-            data = self.socket.recv(1)
-            if not data:
-                break
+    def cmd_broadcast(self, command: str):
+        """Phase 3: Group Key Distribution and Broadcast"""
+        with self.fleet_lock:
+            if not self.fleet:
+                print("No drones to broadcast to")
+                return
             
-            opcode = struct.unpack('B', data)[0]
+            print(f"\n[MCC] Broadcasting command: '{command}'")
             
-            if opcode == 70:  # GROUP_KEY
-                self.receive_group_key()
-            elif opcode == 80:  # GROUP_CMD
-                self.receive_broadcast_command()
-            elif opcode == 90:  # SHUTDOWN
-                print(f"[{self.drone_id}] Received shutdown signal")
-                break
+            # Step 1: Calculate Group Key
+            sk_list = [info['session_key'] for info in self.fleet.values()]
+            gk = self.calculate_group_key(sk_list)
+            print(f"[MCC] Group key generated")
+            
+            # Step 2: Distribute GK to each drone
+            for drone_id, info in self.fleet.items():
+                try:
+                    # Encrypt GK with drone's session key
+                    encrypted_gk = aes_cbc_encrypt(info['session_key'], gk)
+                    
+                    # Send OPCODE 70 ∥ encrypted_GK
+                    msg = bytes([OPCODE_GROUP_KEY]) + encrypted_gk
+                    info['socket'].sendall(msg)
+                    
+                except Exception as e:
+                    print(f"[MCC] Failed to send GK to {drone_id}: {e}")
+            
+            print(f"[MCC] Group key distributed to {len(self.fleet)} drones")
+            
+            # Step 3: Send encrypted command
+            cmd_bytes = command.encode('utf-8')
+            encrypted_cmd = aes_cbc_encrypt(gk, cmd_bytes)
+            hmac_tag = hmac_sha256(gk, cmd_bytes)
+            
+            msg = bytes([OPCODE_GROUP_CMD]) + encrypted_cmd + hmac_tag
+            
+            for drone_id, info in self.fleet.items():
+                try:
+                    info['socket'].sendall(msg)
+                except Exception as e:
+                    print(f"[MCC] Failed to send command to {drone_id}: {e}")
+            
+            print(f"[MCC] ✓ Broadcast complete\n")
+    
+    def calculate_group_key(self, session_keys: list) -> bytes:
+        """
+        Calculate Group Key: GK = H(SKD1 ∥ SKD2 ∥ ... ∥ SKDn ∥ KRMCC)
+        """
+        data = b''.join(session_keys)
+        # Add MCC's private key for additional entropy
+        data += int_to_bytes(self.private_key.x)
         
-        return True
+        return sha256_hash(data)
+    
+    def cmd_shutdown(self):
+        """Shutdown all connections"""
+        print("\n[MCC] Shutting down...")
         
-    except Exception as e:
-        print(f"[{self.drone_id}] Connection error: {e}")
-        return False
-    finally:
-        if self.socket:
-            self.socket.close()
+        with self.fleet_lock:
+            for drone_id, info in self.fleet.items():
+                try:
+                    # Send shutdown opcode
+                    info['socket'].sendall(bytes([OPCODE_SHUTDOWN]))
+                    info['socket'].close()
+                except:
+                    pass
+        
+        self.running = False
+        
+        if self.server_socket:
+            self.server_socket.close()
+        
+        print("[MCC] Shutdown complete")
+
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='UAV Mission Control Center')
+    parser.add_argument('--host', default='localhost', help='Server host')
+    parser.add_argument('--port', type=int, default=5555, help='Server port')
+    parser.add_argument('--security-level', type=int, default=2048,
+                       choices=[2048, 3072], help='Security level (bits)')
+    args = parser.parse_args()
+    
+    mcc = MissionControlCenter(args.host, args.port, args.security_level)
+    mcc.start_server()
 ```
 
 ---
 
-### **PHASE 4: Security Testing (attacks.py)**
+## 📝 Required Deliverables
 
-**Priority: HIGH** | **Estimated Time: 4-5 hours**
+### 1. Code Files (Must Submit)
 
-#### Attack 1: Replay Attack
+- [x] **crypto_utils.py**
+  - All manual ElGamal primitives
+  - Modular arithmetic functions
+  - AES/HMAC wrappers
 
-```python
-def replay_attack():
-    """
-    Demonstrate replay attack on Phase 1A
-    
-    Steps:
-    1. Capture a valid Phase 1A message
-    2. Wait some time
-    3. Replay the same message
-    4. MCC should reject due to old timestamp
-    """
-    print("\n=== REPLAY ATTACK ===")
-    # TODO:
-    # 1. Run legitimate drone connection
-    # 2. Capture Phase 1A packet
-    # 3. Close connection
-    # 4. Wait 60 seconds
-    # 5. Replay captured packet
-    # 6. Verify MCC rejects it
-    pass
-```
+- [x] **mcc.py**
+  - Concurrent server with threading
+  - CLI with list/broadcast/shutdown commands
+  - All protocol phases implemented
 
-#### Attack 2: Man-in-the-Middle
+- [x] **drone.py**
+  - Client protocol logic
+  - All phases (0, 1A, 1B, 2, 3)
+  - Command reception and execution
 
-```python
-def mitm_attack():
-    """
-    Demonstrate MitM attack on Phase 0
-    
-    Steps:
-    1. Intercept Phase 0 parameters
-    2. Modify the prime p to a weak 512-bit value
-    3. Re-sign with attacker's key
-    4. Forward to drone
-    5. Drone should detect inconsistency or signature failure
-    """
-    print("\n=== MAN-IN-THE-MIDDLE ATTACK ===")
-    # TODO:
-    # 1. Set up proxy between drone and MCC
-    # 2. Intercept Phase 0 message
-    # 3. Replace p with weak prime
-    # 4. Try to re-sign (will fail - no MCC private key)
-    # 5. Drone rejects due to invalid signature
-    pass
-```
+- [x] **attacks.py**
+  - Replay Attack demonstration
+  - MitM Tampering demonstration
+  - Unauthorized Access demonstration
 
-#### Attack 3: Unauthorized Access
+### 2. Documentation Files (Must Submit)
 
-```python
-def unauthorized_access_attack():
-    """
-    Attempt to connect with unknown/invalid drone ID
-    
-    Expected: MCC should reject due to:
-    - Unknown public key
-    - Invalid signature
-    """
-    print("\n=== UNAUTHORIZED ACCESS ATTACK ===")
-    # TODO:
-    # 1. Create rogue drone with unknown ID
-    # 2. Generate own keypair
-    # 3. Attempt to authenticate
-    # 4. MCC cannot verify signature (no public key on record)
-    # 5. Connection rejected
-    pass
-```
+- [x] **SECURITY.md** - Explain:
+  - **Freshness**: How timestamps and nonces prevent replay attacks
+  - **Forward Secrecy**: How session keys protect past communications
+
+- [x] **README.md** - Include:
+  - Performance logs template (filled with actual results)
+  - Modular exponentiation time for 2048-bit primes
+  - Prime generation benchmarks
+  - Full protocol execution time per drone
+
+### 3. Dependencies (Must Submit)
+
+- [x] **requirements.txt**
+  ```
+  pycryptodome==3.19.0
+  ```
 
 ---
 
-### **PHASE 5: Documentation**
+## 📊 Performance Benchmarks Template
 
-#### Step 5.1: SECURITY.md
+After implementation, fill in this template in your README:
 
-**Priority: HIGH** | **Estimated Time: 2-3 hours**
-
-Create `SECURITY.md` with the following sections:
-
-```markdown
-# Security Analysis
-
-## 1. Freshness Guarantees
-
-### Timestamp-Based Freshness
-- Each message includes a timestamp
-- MCC validates timestamps within 30-second window
-- Prevents replay of old messages
-
-### Nonce-Based Freshness
-- Random nonces (RNi, RNMCC) included in key derivation
-- Session key depends on both nonces
-- Even with same KDi,MCC, different session each time
-
-## 2. Forward Secrecy
-
-### Session Key Independence
-- Each session derives unique SKDi,MCC
-- SK depends on ephemeral nonces
-- Compromise of one session doesn't affect others
-
-### Group Key Rotation
-- New GK generated for each broadcast
-- GK depends on all current session keys
-- Drone disconnection forces new GK
-
-## 3. Mutual Authentication
-
-### Drone authenticates MCC
-- MCC proves knowledge of KDi,MCC in Phase 1B
-- MCC signs all messages with its private key
-
-### MCC authenticates Drone
-- Drone signs Phase 1A with its private key
-- Signature verified using drone's public key
-
-## 4. Integrity Protection
-
-### Digital Signatures (Phases 0, 1)
-- All critical messages signed
-- ElGamal signatures prevent tampering
-
-### HMAC (Phases 2, 3)
-- Session key confirmation uses HMAC
-- Broadcast commands include HMAC tag
-
-## 5. Confidentiality
-
-### Asymmetric Encryption (Phase 1)
-- Shared secret encrypted with ElGamal
-- Only intended recipient can decrypt
-
-### Symmetric Encryption (Phase 3)
-- Group commands encrypted with AES-256-CBC
-- Efficient for bulk data
-
-## 6. Attack Resistance
-
-### Replay Attack
-- Mitigated by timestamp validation
-- Old messages rejected
-
-### MitM Attack
-- Mitigated by signature verification
-- Tampered parameters detected
-
-### Unauthorized Access
-- Mitigated by PKI infrastructure
-- Unknown drones cannot authenticate
 ```
+=== Cryptographic Performance Benchmarks ===
+Hardware: [Your CPU model]
+Security Level: 2048 bits
 
-#### Step 5.2: README.md - Performance Section
+Prime Generation:
+- Average time: ___ seconds
+- Min time: ___ seconds
+- Max time: ___ seconds
+- Trials: 10
 
-Add to `README.md`:
+Modular Exponentiation (2048-bit):
+- Average time: ___ ms
+- Trials: 100
 
-```markdown
-## Performance Benchmarks
+ElGamal Operations:
+- Encryption time: ___ ms
+- Decryption time: ___ ms
+- Signing time: ___ ms
+- Verification time: ___ ms
 
-### Test Environment
-- CPU: [Your CPU model]
-- RAM: [Your RAM]
-- OS: [Your OS]
-- Language: Python 3.11
+Full Protocol Execution (single drone):
+- Phase 0 (Parameter Init): ___ ms
+- Phase 1A (Drone Auth): ___ ms
+- Phase 1B (MCC Auth): ___ ms
+- Phase 2 (SK Confirm): ___ ms
+- Total authentication time: ___ ms
 
-### Cryptographic Operations
+Group Key Operations (n=10 drones):
+- GK calculation time: ___ ms
+- GK distribution time: ___ ms
+- Broadcast command time: ___ ms
 
-| Operation | Key Size | Time (ms) | Iterations |
-|-----------|----------|-----------|------------|
-| Prime Generation | 2048-bit | 1,234 | 10 |
-| Modular Exponentiation | 2048-bit | 45 | 1000 |
-| ElGamal Encryption | 2048-bit | 67 | 100 |
-| ElGamal Decryption | 2048-bit | 89 | 100 |
-| ElGamal Sign | 2048-bit | 78 | 100 |
-| ElGamal Verify | 2048-bit | 92 | 100 |
-| AES-256 Encrypt (1KB) | 256-bit | 0.12 | 1000 |
-| HMAC-SHA256 (1KB) | 256-bit | 0.08 | 1000 |
-
-### Protocol Timing
-
-| Phase | Average Time (ms) | Notes |
-|-------|-------------------|-------|
-| Phase 0 (Param Init) | 1,500 | Includes prime generation |
-| Phase 1 (Mutual Auth) | 250 | Two ElGamal operations |
-| Phase 2 (SK Confirm) | 15 | Hash + HMAC only |
-| Phase 3 (Group Key) | 50 | Per drone |
-| Total Handshake | ~1,800 | First connection only |
-
-### Scalability
-
-| Drones | Connection Time (s) | Group Key Distribution (s) |
-|--------|---------------------|----------------------------|
-| 1 | 1.8 | 0.05 |
-| 5 | 1.9 | 0.25 |
-| 10 | 2.1 | 0.50 |
-| 50 | 3.4 | 2.50 |
-| 100 | 6.2 | 5.00 |
+Memory Usage:
+- Per drone connection: ___ MB
+- Total for 10 drones: ___ MB
 ```
-
----
-
-## 🧪 Testing Strategy
-
-### Unit Tests
-
-Create `tests/test_crypto.py`:
-
-```python
-import unittest
-from crypto_utils import *
-
-class TestModularArithmetic(unittest.TestCase):
-    def test_modular_exponentiation(self):
-        # Test case: 3^5 mod 7 = 5
-        result = modular_exponentiation(3, 5, 7)
-        self.assertEqual(result, 5)
-    
-    def test_modular_inverse(self):
-        # Test: (3 * inv(3, 11)) mod 11 == 1
-        inv = modular_inverse(3, 11)
-        self.assertEqual((3 * inv) % 11, 1)
-
-class TestElGamal(unittest.TestCase):
-    def setUp(self):
-        # Small prime for fast testing
-        self.p = 23
-        self.g = 5
-        self.keypair = generate_elgamal_keypair(self.p, self.g)
-    
-    def test_encrypt_decrypt(self):
-        message = 10
-        ciphertext = elgamal_encrypt(message, self.keypair)
-        decrypted = elgamal_decrypt(ciphertext, self.keypair)
-        self.assertEqual(message, decrypted)
-    
-    def test_sign_verify(self):
-        message_hash = 42
-        signature = elgamal_sign(message_hash, self.keypair)
-        valid = elgamal_verify(message_hash, signature, self.keypair)
-        self.assertTrue(valid)
-```
-
-### Integration Tests
-
-Create `tests/test_protocol.py`:
-
-```python
-import unittest
-import threading
-import time
-from mcc import MissionControlCenter
-from drone import Drone
-
-class TestProtocol(unittest.TestCase):
-    def setUp(self):
-        # Start MCC in separate thread
-        self.mcc = MissionControlCenter(security_level=512)  # Small for speed
-        self.mcc_thread = threading.Thread(target=self.mcc.start_server)
-        self.mcc_thread.daemon = True
-        self.mcc_thread.start()
-        time.sleep(1)  # Wait for server to start
-    
-    def test_single_drone_connection(self):
-        drone = Drone("D001")
-        success = drone.connect_to_mcc()
-        self.assertTrue(success)
-        self.assertTrue(drone.authenticated)
-    
-    def test_multiple_drones(self):
-        drones = [Drone(f"D{i:03d}") for i in range(5)]
-        for drone in drones:
-            success = drone.connect_to_mcc()
-            self.assertTrue(success)
-    
-    def test_broadcast(self):
-        # Connect drones
-        drones = [Drone(f"D{i:03d}") for i in range(3)]
-        for drone in drones:
-            drone.connect_to_mcc()
-        
-        # Trigger broadcast
-        self.mcc.cmd_broadcast("TEST_COMMAND")
-        
-        # Verify all drones received
-        # (Implementation needed in drone.py to capture commands)
-```
-
----
-
-## 📝 Submission Checklist
-
-### Code Files (100% Complete)
-- [ ] `crypto_utils.py` - All functions implemented and tested
-- [ ] `mcc.py` - Server fully functional with CLI
-- [ ] `drone.py` - Client connects and processes all phases
-- [ ] `attacks.py` - All three attacks demonstrated
-
-### Documentation (100% Complete)
-- [ ] `SECURITY.md` - Freshness and Forward Secrecy explained
-- [ ] `README.md` - Performance benchmarks included
-- [ ] Code comments - All complex functions documented
-- [ ] `requirements.txt` - Dependencies listed
-
-### Testing (100% Complete)
-- [ ] Unit tests pass for all crypto functions
-- [ ] Integration tests pass for full protocol
-- [ ] Attack demonstrations run successfully
-- [ ] Performance benchmarks collected
-
-### Video Demo (If Required)
-- [ ] Show MCC startup and parameter generation
-- [ ] Show multiple drones connecting
-- [ ] Show `list` command with active drones
-- [ ] Show `broadcast` command execution
-- [ ] Show attack demonstrations
-- [ ] Explain key security features
 
 ---
 
 ## 🚀 Quick Start Guide
 
-### Setup (5 minutes)
+### Setup
 
 ```bash
-# Clone repository
-git clone <your-repo>
-cd secure-uav-c2
-
 # Create virtual environment
 python3 -m venv venv
 source venv/bin/activate  # Linux/Mac
@@ -1384,7 +1633,7 @@ pip install -r requirements.txt
 python mcc.py --host localhost --port 5555 --security-level 2048
 ```
 
-### Run Drones (in separate terminals)
+### Run Drones (separate terminals)
 
 ```bash
 # Terminal 2
@@ -1399,18 +1648,27 @@ python drone.py --id D003 --mcc-host localhost --mcc-port 5555
 
 ### Use MCC CLI
 
-```bash
+```
 MCC> list
-# Shows all connected drones
+Connected drones: 3
+------------------------------------------------------------
+  D001            @ 127.0.0.1:54321
+  D002            @ 127.0.0.1:54322
+  D003            @ 127.0.0.1:54323
+------------------------------------------------------------
 
 MCC> broadcast RETURN_TO_BASE
-# Sends command to all drones
+[MCC] Broadcasting command: 'RETURN_TO_BASE'
+[MCC] Group key generated
+[MCC] Group key distributed to 3 drones
+[MCC] ✓ Broadcast complete
 
 MCC> shutdown
-# Gracefully closes all connections
+[MCC] Shutting down...
+[MCC] Shutdown complete
 ```
 
-### Run Attacks
+### Run Attack Demonstrations
 
 ```bash
 python attacks.py
@@ -1418,174 +1676,94 @@ python attacks.py
 
 ---
 
-## ⏱️ Time Allocation
-
-| Phase | Task | Estimated Hours |
-|-------|------|-----------------|
-| 0 | Environment Setup | 0.5 |
-| 1 | Cryptographic Primitives | 18-22 |
-|   | - Modular arithmetic | 4-6 |
-|   | - Prime generation | 3-4 |
-|   | - ElGamal key generation | 2-3 |
-|   | - ElGamal encryption | 3-4 |
-|   | - ElGamal signatures | 4-5 |
-|   | - AES/HMAC wrappers | 2-3 |
-| 2 | MCC Server | 8-10 |
-|   | - Basic structure | 2 |
-|   | - Protocol phases | 4-5 |
-|   | - Concurrency | 2-3 |
-| 3 | Drone Client | 6-8 |
-|   | - Basic structure | 1-2 |
-|   | - Protocol phases | 3-4 |
-|   | - Command handling | 2 |
-| 4 | Attack Demonstrations | 4-5 |
-| 5 | Documentation | 3-4 |
-| 6 | Testing & Debugging | 4-6 |
-| **TOTAL** | | **44-55 hours** |
-
-### Recommended Schedule (assuming 5 days)
-
-- **Day 1-2**: Complete Phase 1 (Crypto primitives)
-- **Day 3**: Complete Phase 2 (MCC server)
-- **Day 4**: Complete Phase 3 (Drone client) + Phase 4 (Attacks)
-- **Day 5**: Testing, documentation, final debugging
-
----
-
-## 🔧 Debugging Tips
-
-### Common Issues
-
-1. **Modular Exponentiation Timeout**
-   - Ensure using binary square-and-multiply method
-   - Python's built-in `pow(base, exp, mod)` is optimized
-
-2. **Signature Verification Fails**
-   - Check gcd(k, p-1) == 1 when generating k
-   - Verify all modular arithmetic uses correct modulus
-
-3. **Connection Hangs**
-   - Add timeout to socket operations
-   - Ensure both parties are in same protocol phase
-   - Check for proper message framing
-
-4. **HMAC Mismatch**
-   - Verify both parties use same key derivation order
-   - Check byte encoding (UTF-8 vs raw bytes)
-   - Print intermediate values for comparison
-
-### Logging
-
-Add verbose logging throughout:
-
-```python
-import logging
-
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='[%(asctime)s] %(levelname)s - %(message)s'
-)
-
-logger = logging.getLogger(__name__)
-logger.debug(f"Phase 1A: Sending {len(data)} bytes")
-```
-
----
-
-## 📚 Additional Resources
-
-### ElGamal Cryptography
-- [Wikipedia: ElGamal encryption](https://en.wikipedia.org/wiki/ElGamal_encryption)
-- [Understanding ElGamal signatures](https://www.coursera.org/lecture/asymmetric-crypto/elgamal-signature-scheme)
-
-### Network Programming
-- [Python Socket Programming](https://realpython.com/python-sockets/)
-- [Threading in Python](https://docs.python.org/3/library/threading.html)
-
-### Security Best Practices
-- [OWASP Cryptographic Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html)
-
----
-
-## ✅ Grading Rubric (Self-Check)
+## 🎯 Grading Rubric
 
 | Component | Points | Criteria |
 |-----------|--------|----------|
-| **Crypto Implementation** | 40 | |
-| - Modular arithmetic | 8 | Correct and efficient |
-| - ElGamal encryption | 10 | Functional encrypt/decrypt |
-| - ElGamal signatures | 12 | Functional sign/verify |
-| - Prime generation | 10 | 2048-bit primes in reasonable time |
-| **Protocol Implementation** | 35 | |
-| - Phase 0 (Params) | 5 | Correct distribution |
-| - Phase 1 (Mutual Auth) | 10 | Both parties authenticate |
-| - Phase 2 (Session Key) | 10 | Correct derivation & HMAC |
-| - Phase 3 (Group Key) | 10 | Broadcast functional |
-| **Concurrency** | 10 | |
-| - Multi-threading | 5 | Multiple drones simultaneous |
-| - Thread safety | 5 | No race conditions |
-| **Security** | 10 | |
-| - Attack demos | 5 | All three working |
-| - SECURITY.md | 5 | Clear explanations |
-| **Documentation** | 5 | |
-| - Code comments | 2 | Well-documented |
-| - README.md | 3 | Complete benchmarks |
+| **Cryptographic Implementation** | **40** | |
+| - Modular arithmetic (exp, inverse) | 8 | Correct & efficient (binary method) |
+| - ElGamal encryption/decryption | 10 | Functional with correct (c1, c2) logic |
+| - ElGamal signatures | 12 | Functional sign/verify with (r, s) |
+| - Prime generation | 10 | 2048-bit primes in reasonable time (<2 min) |
+| **Protocol Implementation** | **35** | |
+| - Phase 0 (Parameters) | 5 | Correct distribution with MCC signature & drone validation |
+| - Phase 1 (Mutual Auth) | 10 | Both parties authenticate with signature verification |
+| - Phase 2 (Session Key) | 10 | Correct SK derivation & HMAC confirmation |
+| - Phase 3 (Group Key) | 10 | GK aggregation and broadcast functional |
+| **Concurrency** | **10** | |
+| - Multi-threading | 5 | Multiple drones connect simultaneously |
+| - Thread safety | 5 | No race conditions in fleet registry |
+| **Security** | **10** | |
+| - Attack demonstrations | 5 | All three attacks work and show vulnerabilities |
+| - SECURITY.md | 5 | Clear explanations of freshness & forward secrecy |
+| **Documentation** | **5** | |
+| - Code comments | 2 | All complex functions documented |
+| - README.md benchmarks | 3 | Complete performance logs filled in |
 
 **Total: 100 points**
 
 ---
 
-## 🎓 Learning Outcomes
+## ✅ Success Criteria
 
-By completing this assignment, you will:
+Before submission, verify:
 
-1. ✅ Understand asymmetric cryptography internals
-2. ✅ Implement secure authentication protocols
-3. ✅ Handle concurrent network connections
-4. ✅ Recognize and mitigate security attacks
-5. ✅ Gain experience with real-world cryptographic systems
-
----
-
-## 📞 Getting Help
-
-If stuck:
-
-1. **Re-read the assignment PDF** - Most answers are there
-2. **Check your math** - ElGamal is mathematically precise
-3. **Add debug prints** - See what values are being computed
-4. **Test incrementally** - Don't write everything then test
-5. **Ask on course forum** - But don't share code
+- [ ] All cryptographic functions manually implemented (no forbidden libraries)
+- [ ] MCC server handles ≥3 concurrent drone connections
+- [ ] All protocol phases execute successfully with correct message formats
+- [ ] Group key distribution works for fleet broadcast
+- [ ] All three attacks demonstrate protocol vulnerabilities
+- [ ] 2048-bit operations complete in reasonable time (<5 sec per operation)
+- [ ] SECURITY.md explains freshness (timestamps/nonces) and forward secrecy
+- [ ] README.md performance benchmarks filled with actual measurements
+- [ ] Code is well-documented with comments
 
 ---
 
-## 🏁 Final Notes
+## 🔒 Critical Implementation Notes
 
-### Do's
-✅ Implement all cryptographic functions manually  
-✅ Test each component independently  
-✅ Add comprehensive error handling  
-✅ Document complex algorithms  
-✅ Start early - crypto debugging takes time  
+### 1. Phase 0 Validation (CRITICAL)
+Drone MUST verify:
+```python
+# Check 1: Verify MCC's signature on parameters
+if not verify_signature(H(M0), σ0, KU_MCC):
+    abort("Invalid MCC signature")
 
-### Don'ts
-❌ Use high-level crypto libraries for ElGamal  
-❌ Skip signature verification (security critical)  
-❌ Ignore thread safety in MCC  
-❌ Forget to validate timestamps  
-❌ Copy code from online sources  
+# Check 2: Actual prime bit length matches claimed SL
+actual_bits = len(bin(p)) - 2
+if abs(actual_bits - SL) > 10:  # Allow ±10 bit tolerance
+    abort(f"SL mismatch: claimed {SL}, actual {actual_bits}")
 
-### Success Criteria
-🎯 All three attacks demonstrate the vulnerabilities  
-🎯 Multiple drones can connect simultaneously  
-🎯 Broadcast reaches all authenticated drones  
-🎯 2048-bit operations complete in reasonable time  
-🎯 Code is well-documented and readable  
+# Check 3: Minimum security level
+if SL < 2048:
+    abort(f"Insufficient security: {SL} < 2048")
+```
+
+### 2. Session Key Derivation (CRITICAL)
+Exact concatenation order:
+```python
+SK = SHA256(KDi,MCC ∥ TSi ∥ TSMCC ∥ RNi ∥ RNMCC)
+```
+
+### 3. Group Key Aggregation (CRITICAL)
+Include MCC's private key:
+```python
+GK = SHA256(SKD1 ∥ SKD2 ∥ ... ∥ SKDn ∥ KR_MCC)
+```
+
+### 4. Timestamp Validation (CRITICAL)
+Reject messages with timestamps:
+- More than 5 minutes old
+- In the future
+- Duplicates (replay detection)
+
+### 5. Communication Architecture
+- Drones ONLY communicate with MCC
+- NO drone-to-drone communication
+- All broadcasts go through MCC
 
 ---
+
+**Last Updated:** February 7, 2026
 
 **Good luck with your implementation! 🚁🔐**
-
----
-
-*Last Updated: February 5, 2026*

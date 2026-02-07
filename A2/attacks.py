@@ -76,11 +76,21 @@ class ReplayAttack:
             
             # Simulate sending old authentication (would be captured in real scenario)
             old_phase1a = struct.pack('B', 20)  # OPCODE 20
-            old_phase1a += struct.pack('>Q', int(time.time() * 1000) - 40000)  # Old timestamp
+            old_phase1a += struct.pack('>Q', int(time.time() * 1000) - 40000)  # Old timestamp (40s old)
             old_phase1a += b'\x00' * 32  # Dummy nonce
             old_phase1a += struct.pack('>I', len(drone_id)) + drone_id.encode('utf-8')
             
-            socket_replay.sendall(old_phase1a)
+            # Add dummy encrypted data (c1, c2) - required by Phase 1A format
+            old_phase1a += int_to_bytes_variable(random.randint(1000, 10000))  # c1
+            old_phase1a += int_to_bytes_variable(random.randint(1000, 10000))  # c2
+            
+            # Add dummy signature (r, s) - required by Phase 1A format
+            old_phase1a += int_to_bytes_variable(random.randint(100, 1000))  # r
+            old_phase1a += int_to_bytes_variable(random.randint(100, 1000))  # s
+            
+            # Send with length prefix (MCC expects length-prefixed messages)
+            length_prefix = struct.pack('>I', len(old_phase1a))
+            socket_replay.sendall(length_prefix + old_phase1a)
             
             # Wait for response
             time.sleep(2)
@@ -217,19 +227,21 @@ class UnauthorizedAccessAttack:
             print("[UNAUTHORIZED] Step 3: Sending Phase 1A with unknown ID")
             
             phase1a = struct.pack('B', 20)  # OPCODE 20
-            phase1a += struct.pack('>Q', int(time.time() * 1000))
+            phase1a += struct.pack('>Q', int(time.time() * 1000))  # Current timestamp
             phase1a += b'\x00' * 32  # Dummy nonce
             phase1a += struct.pack('>I', len(attacker_id)) + attacker_id.encode('utf-8')
             
-            # Add dummy encrypted data
-            phase1a += int_to_bytes_variable(random.randint(1000, 2000))
-            phase1a += int_to_bytes_variable(random.randint(2000, 3000))
+            # Add dummy encrypted data (c1, c2)
+            phase1a += int_to_bytes_variable(random.randint(1000, 10000))  # c1
+            phase1a += int_to_bytes_variable(random.randint(1000, 10000))  # c2
             
-            # Add dummy signature
-            phase1a += int_to_bytes_variable(random.randint(100, 200))
-            phase1a += int_to_bytes_variable(random.randint(200, 300))
+            # Add dummy signature (r, s)
+            phase1a += int_to_bytes_variable(random.randint(100, 1000))  # r
+            phase1a += int_to_bytes_variable(random.randint(100, 1000))  # s
             
-            socket_attack.sendall(phase1a)
+            # Send with length prefix
+            length_prefix = struct.pack('>I', len(phase1a))
+            socket_attack.sendall(length_prefix + phase1a)
             print("[UNAUTHORIZED] Sent Phase 1A")
             
             # Wait for response
@@ -362,19 +374,21 @@ class DroneImpersonationAttack:
             print(f"[IMPERSONATION] Sending Phase 1A as {target_drone_id}")
             
             phase1a = struct.pack('B', 20)  # OPCODE 20
-            phase1a += struct.pack('>Q', int(time.time() * 1000))
+            phase1a += struct.pack('>Q', int(time.time() * 1000))  # Current timestamp
             phase1a += b'\x00' * 32  # Dummy nonce
             
             drone_id_bytes = target_drone_id.encode('utf-8')
             phase1a += struct.pack('>I', len(drone_id_bytes)) + drone_id_bytes
             
             # Add encrypted data and signature (using rogue key)
-            phase1a += int_to_bytes_variable(random.randint(1000, 2000))
-            phase1a += int_to_bytes_variable(random.randint(2000, 3000))
-            phase1a += int_to_bytes_variable(random.randint(100, 200))
-            phase1a += int_to_bytes_variable(random.randint(200, 300))
+            phase1a += int_to_bytes_variable(random.randint(1000, 10000))  # c1
+            phase1a += int_to_bytes_variable(random.randint(1000, 10000))  # c2
+            phase1a += int_to_bytes_variable(random.randint(100, 1000))  # r
+            phase1a += int_to_bytes_variable(random.randint(100, 1000))  # s
             
-            socket_rogue.sendall(phase1a)
+            # Send with length prefix
+            length_prefix = struct.pack('>I', len(phase1a))
+            socket_rogue.sendall(length_prefix + phase1a)
             
             print("[IMPERSONATION] Awaiting response...")
             time.sleep(2)
@@ -454,6 +468,70 @@ def run_all_attacks(mcc_host='localhost', mcc_port=5555):
     print("="*70 + "\n")
 
 
+def interactive_menu(mcc_host='localhost', mcc_port=5555):
+    """Interactive attack menu where user can select attacks."""
+    print("\n" + "="*70)
+    print("SECURE UAV C2 SYSTEM - INTERACTIVE ATTACK DEMONSTRATION")
+    print("="*70)
+    print(f"Target MCC: {mcc_host}:{mcc_port}")
+    print("="*70)
+    
+    # Initialize attack objects
+    replay = ReplayAttack(mcc_host, mcc_port)
+    mitm = MitmAttack(mcc_host, mcc_port)
+    unauth = UnauthorizedAccessAttack(mcc_host, mcc_port)
+    tamper = MessageTamperingAttack()
+    imperson = DroneImpersonationAttack(mcc_host, mcc_port)
+    
+    while True:
+        print("\n" + "="*70)
+        print("ATTACK MENU")
+        print("="*70)
+        print("Available Attacks:")
+        print("  [r] - Replay Attack")
+        print("  [m] - Man-in-the-Middle (MITM) Attack")
+        print("  [u] - Unauthorized Access Attack")
+        print("  [t] - Message Tampering Attack")
+        print("  [i] - Drone Impersonation Attack")
+        print("  [a] - Run All Attacks Sequentially")
+        print("  [q] - Quit")
+        print("="*70)
+        
+        choice = input("\nSelect attack [r/m/u/t/i/a/q]: ").strip().lower()
+        
+        if choice == 'r':
+            print("\n[*] Launching Replay Attack...")
+            replay.run('D001')
+        
+        elif choice == 'm':
+            print("\n[*] Launching Man-in-the-Middle Attack...")
+            mitm.run()
+        
+        elif choice == 'u':
+            print("\n[*] Launching Unauthorized Access Attack...")
+            unauth.run('ROGUE_DRONE')
+        
+        elif choice == 't':
+            print("\n[*] Launching Message Tampering Attack...")
+            tamper.run()
+        
+        elif choice == 'i':
+            print("\n[*] Launching Drone Impersonation Attack...")
+            imperson.run('D001')
+        
+        elif choice == 'a':
+            print("\n[*] Launching All Attacks Sequentially...")
+            run_all_attacks(mcc_host, mcc_port)
+        
+        elif choice == 'q':
+            print("\n[*] Exiting Attack Demonstration...")
+            print("="*70 + "\n")
+            break
+        
+        else:
+            print("\n[!] Invalid choice. Please select a valid option.")
+
+
 def main():
     """Main entry point."""
     import argparse
@@ -461,6 +539,8 @@ def main():
     parser = argparse.ArgumentParser(description="Security Attack Demonstrations")
     parser.add_argument('--mcc-host', default='localhost', help='MCC host')
     parser.add_argument('--mcc-port', type=int, default=5555, help='MCC port')
+    parser.add_argument('--auto', action='store_true', 
+                       help='Run all attacks automatically (non-interactive)')
     
     args = parser.parse_args()
     
@@ -481,7 +561,10 @@ def main():
             time.sleep(1)
     
     # Run attacks
-    run_all_attacks(args.mcc_host, args.mcc_port)
+    if args.auto:
+        run_all_attacks(args.mcc_host, args.mcc_port)
+    else:
+        interactive_menu(args.mcc_host, args.mcc_port)
 
 
 if __name__ == "__main__":

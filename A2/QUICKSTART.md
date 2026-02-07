@@ -34,7 +34,7 @@ Running crypto utility tests...
 ### Terminal 1: Start MCC Server
 
 ```bash
-python mcc.py --host localhost --port 5555 --security-level 2048
+python3 mcc.py --host localhost --port 8000 --security-level 2048
 ```
 
 Output:
@@ -55,7 +55,7 @@ Commands: list | broadcast <cmd> | shutdown | status
 ### Terminal 2: Start Drone 1
 
 ```bash
-python drone.py --id D001 --mcc-host localhost --mcc-port 5555
+python3 drone.py --id D001 --mcc-host localhost --mcc-port 8000
 ```
 
 Output:
@@ -80,7 +80,7 @@ Output:
 ### Terminal 3: Start Drone 2 (Optional)
 
 ```bash
-python drone.py --id D002 --mcc-host localhost --mcc-port 5555
+python3 drone.py --id D002 --mcc-host localhost --mcc-port 8000
 ```
 
 ### Terminal 1 (MCC): Execute Commands
@@ -141,7 +141,7 @@ MCC> shutdown
 In a new terminal:
 
 ```bash
-python attacks.py --mcc-host localhost --mcc-port 5555
+python3 attacks.py --mcc-host localhost --mcc-port 8000
 ```
 
 ### Expected Output

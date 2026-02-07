@@ -65,6 +65,24 @@ class Drone:
         
         print(f"[{self.drone_id}] Initialized")
     
+    def recv_message(self):
+        """Receive a length-prefixed message from socket."""
+        length_data = b''
+        while len(length_data) < 4:
+            chunk = self.socket.recv(4 - len(length_data))
+            if not chunk:
+                return None
+            length_data += chunk
+        msg_len = struct.unpack('>I', length_data)[0]
+        
+        data = b''
+        while len(data) < msg_len:
+            chunk = self.socket.recv(min(8192, msg_len - len(data)))
+            if not chunk:
+                return None
+            data += chunk
+        return data
+    
     # ========================================================================
     # PHASE 0: Receive Cryptographic Parameters from MCC
     # ========================================================================
@@ -79,8 +97,11 @@ class Drone:
         - Signature verification
         """
         try:
-            # Receive OPCODE 10 message
-            data = self.socket.recv(8192)
+            # Receive length-prefixed OPCODE 10 message
+            data = self.recv_message()
+            if not data:
+                print(f"[{self.drone_id}] No data received in Phase 0")
+                return False
             
             if data[0] != 10:
                 print(f"[{self.drone_id}] Invalid opcode in Phase 0: {data[0]}")
@@ -103,10 +124,10 @@ class Drone:
             offset += 8
             
             # Parse MCC ID
-            idmcc_len = struct.unpack('>I', data[offset:offset+4])[0]
-            offset += 4
-            idmcc = data[offset:offset+idmcc_len]
-            offset += idmcc_len
+            idmcc_int, offset = bytes_from_int_variable(data, offset)
+            
+            # Parse MCC's public key Y
+            mcc_y, offset = bytes_from_int_variable(data, offset)
             
             # Parse signature (r, s)
             sig_r, offset = bytes_from_int_variable(data, offset)
@@ -123,10 +144,8 @@ class Drone:
                 print(f"[{self.drone_id}] Prime bit length mismatch: {self.p.bit_length()} vs {self.security_level}")
                 return False
             
-            # Create MCC's public key for signature verification
-            # Note: In real system, this would be from PKI
-            # For demo, we accept the params
-            self.mcc_public_key = ElGamalKey(self.p, self.g, y=42)  # Dummy
+            # Create MCC's public key from received Y
+            self.mcc_public_key = ElGamalKey(self.p, self.g, y=mcc_y)
             
             print(f"[{self.drone_id}] Phase 0: Received parameters")
             print(f"[{self.drone_id}]   - Prime: {self.p.bit_length()} bits")
@@ -188,15 +207,17 @@ class Drone:
             
             # Sign message with drone's private key
             msg_hash = hash_sha256_int(msg_1a) % (self.p - 1)
-            signature = (random.randint(1, self.p-2), random.randint(1, self.p-2))  # Dummy sig for demo
+            from crypto_utils import elgamal_sign
+            signature = elgamal_sign(msg_hash, self.keypair)
             
             # Pack full message
             full_msg = struct.pack('B', 20)  # OPCODE 20
             full_msg += msg_1a
             full_msg += int_to_bytes_variable(signature[0]) + int_to_bytes_variable(signature[1])
             
-            # Send
-            self.socket.sendall(full_msg)
+            # Send with length prefix
+            length_prefix = struct.pack('>I', len(full_msg))
+            self.socket.sendall(length_prefix + full_msg)
             print(f"[{self.drone_id}] Phase 1A: Sent authentication request")
             
             return True
@@ -222,8 +243,11 @@ class Drone:
         - Signature: (variable)
         """
         try:
-            # Receive message
-            data = self.socket.recv(8192)
+            # Receive length-prefixed message
+            data = self.recv_message()
+            if not data:
+                print(f"[{self.drone_id}] No data received in Phase 1B")
+                return False
             
             if data[0] != 30:
                 print(f"[{self.drone_id}] Invalid opcode in Phase 1B: {data[0]}")
@@ -245,10 +269,9 @@ class Drone:
             idmcc = data[offset:offset+idmcc_len]
             offset += idmcc_len
             
-            # Parse encrypted secret (c1, c2)
-            cmcc_c1, offset = bytes_from_int_variable(data, offset)
-            cmcc_c2, offset = bytes_from_int_variable(data, offset)
-            cmcc = (cmcc_c1, cmcc_c2)
+            # Parse HMAC proof (32 bytes)
+            received_proof = data[offset:offset+32]
+            offset += 32
             
             # Parse signature
             sig_r, offset = bytes_from_int_variable(data, offset)
@@ -261,10 +284,15 @@ class Drone:
                 print(f"[{self.drone_id}] Phase 1B: Timestamp too old/future")
                 return False
             
-            # Decrypt CMCC to verify it matches our shared secret
-            # For demo: we'll just proceed with the shared secret
+            # Verify MCC's proof of shared secret knowledge
+            secret_bytes = int_to_bytes(self.shared_secret)
+            expected_proof = hmac_sha256(hash_sha256(secret_bytes), idmcc + struct.pack('>Q', self.mcc_timestamp))
+            if received_proof != expected_proof:
+                print(f"[{self.drone_id}] Phase 1B: MCC failed proof of shared secret!")
+                return False
             
             print(f"[{self.drone_id}] Phase 1B: Received MCC response")
+            print(f"[{self.drone_id}] Phase 1B: MCC proved knowledge of shared secret")
             return True
             
         except Exception as e:
@@ -288,7 +316,11 @@ class Drone:
         """
         try:
             # Derive session key
-            sk_material = int_to_bytes(self.shared_secret, 32)
+            # Convert shared secret to bytes (variable length, then hash it)
+            secret_bytes = int_to_bytes(self.shared_secret)
+            secret_hash = hash_sha256(secret_bytes)
+            
+            sk_material = secret_hash
             sk_material += struct.pack('>Q', self.my_timestamp)
             sk_material += struct.pack('>Q', self.mcc_timestamp)
             sk_material += self.my_nonce
@@ -296,7 +328,7 @@ class Drone:
             
             self.session_key = hash_sha256(sk_material)
             
-            # Create final message
+            # Create final timestamp and include it in the message
             final_ts = struct.pack('>Q', int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF)
             hmac_data = self.drone_id.encode('utf-8') if isinstance(self.drone_id, str) else self.drone_id
             hmac_data += final_ts
@@ -304,12 +336,14 @@ class Drone:
             # Compute HMAC
             hmac_value = hmac_sha256(self.session_key, hmac_data)
             
-            # Pack message
+            # Pack message: OPCODE || TSfinal || HMAC
             full_msg = struct.pack('B', 40)  # OPCODE 40
-            full_msg += hmac_value
+            full_msg += final_ts              # 8 bytes - so MCC can compute same HMAC
+            full_msg += hmac_value            # 32 bytes
             
-            # Send
-            self.socket.sendall(full_msg)
+            # Send with length prefix
+            length_prefix = struct.pack('>I', len(full_msg))
+            self.socket.sendall(length_prefix + full_msg)
             print(f"[{self.drone_id}] Phase 2: Sent session key confirmation")
             print(f"[{self.drone_id}]   Session Key: {self.session_key.hex()[:32]}...")
             
