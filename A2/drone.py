@@ -9,15 +9,14 @@ import socket
 import struct
 import time
 import sys
-import threading
-from crypto_utils import (
-    generate_large_prime, find_generator, generate_elgamal_keypair,
-    ElGamalKey, elgamal_encrypt, elgamal_decrypt, elgamal_verify,
-    hash_sha256, hash_sha256_int, hmac_sha256, aes_encrypt, aes_decrypt,
-    bytes_to_int, int_to_bytes, int_to_bytes_variable, bytes_from_int_variable,
-    deserialize_key
-)
 import random
+import argparse
+from crypto_utils import (
+    generate_elgamal_keypair,
+    ElGamalKey, elgamal_encrypt, elgamal_verify,
+    hash_sha256, hash_sha256_int, hmac_sha256, aes_encrypt, aes_decrypt,
+    int_to_bytes, int_to_bytes_variable, bytes_from_int_variable
+)
 
 
 # ============================================================================
@@ -134,21 +133,55 @@ class Drone:
             sig_s, offset = bytes_from_int_variable(data, offset)
             signature = (sig_r, sig_s)
             
-            # Validate security level
-            if self.security_level < 2048:
-                print(f"[{self.drone_id}] Invalid security level: {self.security_level}")
+            # SECURITY CHECK 1: Validate security level meets minimum safety requirement
+            MIN_SECURITY_LEVEL = 2048
+            if self.security_level < MIN_SECURITY_LEVEL:
+                print(f"[{self.drone_id}] Phase 0: REJECTED - Security level too weak")
+                print(f"[{self.drone_id}]   Claimed SL: {self.security_level} bits")
+                print(f"[{self.drone_id}]   Required: >= {MIN_SECURITY_LEVEL} bits")
+                print(f"[{self.drone_id}]   TAMPER DETECTED: MitM may be forcing weak parameters")
                 return False
             
-            # Validate prime bit length
-            if abs(self.p.bit_length() - self.security_level) > 2:
-                print(f"[{self.drone_id}] Prime bit length mismatch: {self.p.bit_length()} vs {self.security_level}")
+            # SECURITY CHECK 2: Validate prime bit length matches claimed security level
+            # Defense against MitM replacing prime with weak value while claiming high SL
+            actual_bits = self.p.bit_length()
+            claimed_bits = self.security_level
+            
+            if abs(actual_bits - claimed_bits) > 2:
+                print(f"[{self.drone_id}] Phase 0: REJECTED - Prime/SL inconsistency")
+                print(f"[{self.drone_id}]   Actual prime length: {actual_bits} bits")
+                print(f"[{self.drone_id}]   Claimed SL: {claimed_bits} bits")
+                print(f"[{self.drone_id}]   Mismatch: {abs(actual_bits - claimed_bits)} bits")
+                print(f"[{self.drone_id}]   TAMPER DETECTED: MitM modified prime parameter")
+                print(f"[{self.drone_id}]   Connection will be CLOSED for security")
                 return False
             
             # Create MCC's public key from received Y
             self.mcc_public_key = ElGamalKey(self.p, self.g, y=mcc_y)
             
-            print(f"[{self.drone_id}] Phase 0: Received parameters")
-            print(f"[{self.drone_id}]   - Prime: {self.p.bit_length()} bits")
+            # SECURITY CHECK 3: Verify MCC's signature on Phase 0 parameters
+            # Reconstructs the exact message MCC signed and validates signature
+            # If signature fails, parameters were tampered during transmission
+            msg_phase0 = int_to_bytes_variable(self.p)
+            msg_phase0 += int_to_bytes_variable(self.g)
+            msg_phase0 += struct.pack('>I', self.security_level)
+            msg_phase0 += struct.pack('>Q', ts0)
+            msg_phase0 += int_to_bytes_variable(idmcc_int)
+            msg_phase0 += int_to_bytes_variable(mcc_y)
+            
+            msg_hash = hash_sha256_int(msg_phase0)
+            if not elgamal_verify(msg_hash, signature, self.mcc_public_key):
+                print(f"[{self.drone_id}] Phase 0: REJECTED - Signature verification FAILED")
+                print(f"[{self.drone_id}]   TAMPER DETECTED: Parameters modified by MitM")
+                print(f"[{self.drone_id}]   Connection will be CLOSED for security")
+                return False
+            
+            print(f"[{self.drone_id}] Phase 0: ✓ ALL SECURITY CHECKS PASSED")
+            print(f"[{self.drone_id}]   ✓ Security level adequate ({self.security_level} >= 2048)")
+            print(f"[{self.drone_id}]   ✓ Prime length consistent ({actual_bits} ≈ {claimed_bits})")
+            print(f"[{self.drone_id}]   ✓ MCC signature valid (no tampering)")
+            print(f"[{self.drone_id}] Phase 0: Parameters accepted")
+            print(f"[{self.drone_id}]   - Prime: {actual_bits} bits")
             print(f"[{self.drone_id}]   - Generator: {self.g}")
             print(f"[{self.drone_id}]   - Security Level: {self.security_level}")
             
@@ -478,7 +511,8 @@ class Drone:
             
             # Phase 0: Receive parameters
             if not self.receive_phase0_params():
-                print(f"[{self.drone_id}] Phase 0 failed")
+                print(f"[{self.drone_id}] Phase 0 FAILED - Aborting connection")
+                print(f"[{self.drone_id}] Connection CLOSED for security (possible MitM attack)")
                 return False
             
             time.sleep(0.1)
@@ -530,7 +564,10 @@ class Drone:
                         self.receive_broadcast_command(data)
                     
                     elif opcode == 90:  # SHUTDOWN
-                        print(f"[{self.drone_id}] Received shutdown signal")
+                        print(f"[{self.drone_id}] \n" + "="*60)
+                        print(f"[{self.drone_id}] SHUTDOWN SIGNAL RECEIVED FROM MCC")
+                        print(f"[{self.drone_id}] " + "="*60)
+                        self.running = False
                         break
                     
                     else:
@@ -560,12 +597,10 @@ class Drone:
 
 def main():
     """Main entry point."""
-    import argparse
-    
     parser = argparse.ArgumentParser(description="UAV Drone Client")
     parser.add_argument('--id', dest='drone_id', required=True, help='Drone ID')
     parser.add_argument('--mcc-host', default='localhost', help='MCC host address')
-    parser.add_argument('--mcc-port', type=int, default=5555, help='MCC port')
+    parser.add_argument('--mcc-port', type=int, default=8002, help='MCC port')
     
     args = parser.parse_args()
     
@@ -578,9 +613,14 @@ def main():
             print(f"[{args.drone_id}] Connection completed successfully")
         else:
             print(f"[{args.drone_id}] Connection failed")
+            sys.exit(1)
     except KeyboardInterrupt:
         print(f"\n[{args.drone_id}] Interrupted")
         drone.running = False
+    finally:
+        # Ensure clean exit
+        print(f"[{args.drone_id}] Shutting down...")
+        sys.exit(0)
 
 
 if __name__ == "__main__":

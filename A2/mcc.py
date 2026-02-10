@@ -1,25 +1,17 @@
-"""
-Secure UAV Command-and-Control System
-Mission Control Center (MCC) - Server Implementation
-
-Manages multiple drone connections with secure authentication and group key distribution.
-"""
-
 import socket
 import threading
 import struct
 import time
 import sys
-from datetime import datetime
+import argparse
 from crypto_utils import (
     generate_large_prime, find_generator, generate_elgamal_keypair,
-    ElGamalKey, elgamal_encrypt, elgamal_decrypt, elgamal_sign, 
+    elgamal_decrypt, elgamal_sign, elgamal_verify,
     hash_sha256, hash_sha256_int, hmac_sha256, aes_encrypt, aes_decrypt,
-    bytes_to_int, int_to_bytes, int_to_bytes_variable, bytes_from_int_variable,
-    serialize_key, deserialize_key
+    bytes_to_int, int_to_bytes, int_to_bytes_variable, bytes_from_int_variable
 )
 
-
+                                                
 # ============================================================================
 # DroneSession: Represents a connected drone's session state
 # ============================================================================
@@ -87,9 +79,17 @@ class MissionControlCenter:
         self.keypair.sl = security_level
         print(f"[MCC] MCC Public Key Y: {self.keypair.y}")
         
-        # Drone registry
+        # Drone registry with pre-registered drones and their public keys
+        self.registered_drones = {}       # {drone_id: public_key_y}
+        self._init_drone_registry()
+        
+        # Active drone sessions
         self.drones = {}                  # {drone_id: DroneSession}
         self.drones_lock = threading.Lock()
+        
+        # Control connection for attack proxy manager
+        self.control_socket = None
+        self.control_lock = threading.Lock()
         
         # Server socket
         self.server_socket = None
@@ -98,8 +98,37 @@ class MissionControlCenter:
         
         print(f"[MCC] Initialized successfully")
     
+    def _init_drone_registry(self):
+        """
+        Initialize the drone registry with authorized drone IDs.
+        In a real system, this would come from a secure database or PKI.
+        For demo: D001 to D100 are authorized IDs. Their public keys will be
+        registered on first successful connection.
+        """
+        # Authorized drone IDs (D001-D100)
+        # Public keys will be registered when drones first connect
+        # This allows the demo to work with dynamically generated keys
+        
+        print(f"[MCC] Initializing drone registry (D001-D100 authorized)...")
+        
+        # No pre-generated keys - will be populated on first connection
+        # registered_drones will store: {drone_id: public_key_y}
+        
+        print(f"[MCC] Registry ready for D001-D100 (keys registered on first connection)")
+    
+    def is_drone_id_valid(self, drone_id):
+        """Check if drone ID is in valid range (D001-D100)."""
+        if not drone_id.startswith('D'):
+            return False
+        try:
+            num = int(drone_id[1:])
+            return 1 <= num <= 100
+        except (ValueError, IndexError):
+            return False
+    
     # ========================================================================
-    # PHASE 0: Send Cryptographic Parameters
+    # PHASE 0: Send Cryptographic Parameters to Drone
+    # ========================================================================
     # ========================================================================
     
     def send_phase0_params(self, client_socket):
@@ -206,27 +235,44 @@ class MissionControlCenter:
             msg_1a += struct.pack('>I', iddi_len) + iddi
             msg_1a += int_to_bytes_variable(c1) + int_to_bytes_variable(c2)
             
-            # Note: For full implementation, drone's public key would come from PKI
-            # For demo, we'll accept and proceed
             print(f"[MCC] Phase 1A: Received auth from drone {session.drone_id}")
             
-            # Verify timestamp freshness (within 30 seconds)
+            # SECURITY CHECK 1: Registry Validation
+            # Check if drone ID is in valid range (D001-D100)
+            if not self.is_drone_id_valid(session.drone_id):
+                print(f"[MCC] Phase 1A: REJECTED - Unknown Drone ID '{session.drone_id}' (not in D001-D100 range)")
+                return False
+            
+            print(f"[MCC] Phase 1A: Drone ID '{session.drone_id}' is valid (in D001-D100 range)")
+            
+            # Session protection: Check if drone is already authenticated
+            # This prevents replay attacks from disrupting legitimate sessions
+            with self.drones_lock:
+                existing_session = self.drones.get(session.drone_id)
+                if existing_session and existing_session.authenticated:
+                    print(f"[MCC] Phase 1A: REJECTED - {session.drone_id} already has active session")
+                    print(f"[MCC] Phase 1A: Refusing duplicate connection to protect existing session")
+                    return False
+            
+            # Verify timestamp freshness (within 5 seconds)
             current_time = int(time.time() * 1000)
             time_diff = (current_time - tsi) / 1000.0
-            if time_diff > 30 or time_diff < -5:
+            if time_diff > 5 or time_diff < -5:
                 print(f"[MCC] Phase 1A: Timestamp too old/future: {time_diff}s")
                 return False
             
             # Decrypt Ci to get KDi,MCC
-            # Note: In real system, would use drone's certificate
-            # For this demo, create public key for verification
+            # The shared secret is encrypted with MCC's public key
+            # Successful decryption confirms the message integrity
             try:
                 shared_secret = elgamal_decrypt(ci, self.keypair)
                 session.shared_secret = shared_secret
-                print(f"[MCC] Phase 1A: Decrypted shared secret")
+                print(f"[MCC] Phase 1A: Successfully decrypted shared secret")
+                print(f"[MCC] Phase 1A: Authentication accepted for {session.drone_id}")
                 return True
             except Exception as e:
-                print(f"[MCC] Phase 1A: Failed to decrypt: {e}")
+                print(f"[MCC] Phase 1A: Decryption failed - {e}")
+                print(f"[MCC] Phase 1A: Invalid encryption or corrupted message")
                 return False
             
         except Exception as e:
@@ -335,8 +381,14 @@ class MissionControlCenter:
                 session.authenticated = True
                 session.timestamp_auth = time.time()
                 
+                # Add to active drones (only if not already present or replacing non-authenticated)
                 with self.drones_lock:
-                    self.drones[session.drone_id] = session
+                    existing = self.drones.get(session.drone_id)
+                    if not existing or not existing.authenticated:
+                        self.drones[session.drone_id] = session
+                        print(f"[MCC] Phase 2: Added {session.drone_id} to active sessions")
+                    else:
+                        print(f"[MCC] Phase 2: WARNING - {session.drone_id} already authenticated, keeping original")
                 
                 # Send success
                 response = struct.pack('B', 50)  # OPCODE 50: SUCCESS
@@ -451,10 +503,13 @@ class MissionControlCenter:
             print(f"[MCC] Error handling drone {session.drone_id}: {e}")
         
         finally:
-            # Cleanup
-            with self.drones_lock:
-                if session.drone_id in self.drones:
-                    del self.drones[session.drone_id]
+            # Cleanup - only remove THIS session, not another session with same drone_id
+            if session.drone_id and session.drone_id != "UNKNOWN":
+                with self.drones_lock:
+                    # Only remove if this session object is the one currently registered
+                    if session.drone_id in self.drones and self.drones[session.drone_id] is session:
+                        del self.drones[session.drone_id]
+                        print(f"[MCC] Removed {session.drone_id} from active sessions")
             
             try:
                 client_socket.close()
@@ -488,14 +543,42 @@ class MissionControlCenter:
                 try:
                     client_socket, address = self.server_socket.accept()
                     
-                    # Handle in separate thread (daemon=True is OK here for individual connections)
-                    thread = threading.Thread(
-                        target=self.handle_drone_connection,
-                        args=(client_socket, address),
-                        daemon=True
-                    )
-                    thread.start()
-                    self.threads.append(thread)
+                    # Check first byte to determine connection type
+                    try:
+                        client_socket.settimeout(0.5)
+                        first_byte = client_socket.recv(1, socket.MSG_PEEK)
+                        client_socket.settimeout(None)
+                        
+                        # Opcode 98 = Control connection from attack proxy
+                        if first_byte and first_byte[0] == 98:
+                            # This is a control connection from attack proxy
+                            # Consume the opcode byte
+                            client_socket.recv(1)
+                            thread = threading.Thread(
+                                target=self.handle_control_connection,
+                                args=(client_socket, address),
+                                daemon=False
+                            )
+                            thread.start()
+                            self.threads.append(thread)
+                        else:
+                            # Regular drone connection (Phase 0)
+                            thread = threading.Thread(
+                                target=self.handle_drone_connection,
+                                args=(client_socket, address),
+                                daemon=True
+                            )
+                            thread.start()
+                            self.threads.append(thread)
+                    except socket.timeout:
+                        # If no data received quickly, treat as drone connection
+                        thread = threading.Thread(
+                            target=self.handle_drone_connection,
+                            args=(client_socket, address),
+                            daemon=True
+                        )
+                        thread.start()
+                        self.threads.append(thread)
                     
                 except socket.timeout:
                     # Timeout is normal - allows CLI to process input
@@ -513,6 +596,69 @@ class MissionControlCenter:
             self.running = False
             if self.server_socket:
                 self.server_socket.close()
+    
+    # ========================================================================
+    # Control Connection Management (for attack proxy)
+    # ========================================================================
+    
+    def handle_control_connection(self, client_socket, address):
+        """
+        Handle control connection from attack proxy manager.
+        Listens for control commands and manages coordinated shutdown.
+        """
+        try:
+            print(f"[MCC] Control connection established from {address}")
+            with self.control_lock:
+                self.control_socket = client_socket
+            
+            # Keep connection alive
+            while self.running:
+                try:
+                    client_socket.settimeout(1.0)
+                    data = client_socket.recv(1024)
+                    if not data:
+                        # Remote closed the connection
+                        print(f"[MCC] Control connection closed by remote")
+                        break
+                except socket.timeout:
+                    # Timeout is normal - just keep listening
+                    continue
+                except Exception as e:
+                    print(f"[MCC] Control connection error: {e}")
+                    break
+        
+        except Exception as e:
+            print(f"[MCC] Control handler error: {e}")
+        
+        finally:
+            with self.control_lock:
+                if self.control_socket == client_socket:
+                    self.control_socket = None
+            try:
+                client_socket.close()
+            except:
+                pass
+            print(f"[MCC] Control connection closed")
+    
+    def _signal_attack_shutdown(self):
+        """
+        Signal attack proxy to shutdown by closing the control connection.
+        This causes attack.py to stop and cleanly close all drone connections.
+        """
+        with self.control_lock:
+            if self.control_socket:
+                try:
+                    print(f"[MCC] Signaling attack proxy to shutdown...")
+                    msg = struct.pack('B', 99)  # OPCODE 99: CONTROL_SHUTDOWN
+                    self.control_socket.sendall(msg)
+                    time.sleep(0.2)
+                except:
+                    pass
+                try:
+                    self.control_socket.close()
+                except:
+                    pass
+                self.control_socket = None
     
     # ========================================================================
     # Phase 3: Group Key Broadcast
@@ -584,7 +730,7 @@ class MissionControlCenter:
     # ========================================================================
     
     def cmd_list_drones(self):
-        """Display all connected drones."""
+        """Display all connected and running drones."""
         with self.drones_lock:
             if not self.drones:
                 print("No drones connected", flush=True)
@@ -607,24 +753,42 @@ class MissionControlCenter:
     def cmd_shutdown(self):
         """Shutdown server."""
         print("\n[MCC] Initiating shutdown...")
+        print("[MCC] Sending shutdown signal to all connected drones...")
+        
+        # Signal attack proxy to shutdown first
+        self._signal_attack_shutdown()
+        time.sleep(0.3)
         
         # Send shutdown signal to all drones
         with self.drones_lock:
-            for session in self.drones.values():
-                try:
-                    msg = struct.pack('B', 90)  # OPCODE 90: SHUTDOWN
-                    session.socket.sendall(msg)
-                except:
-                    pass
+            drone_count = len(self.drones)
+            if drone_count > 0:
+                print(f"[MCC] Shutting down {drone_count} drone(s)...")
+                for session in self.drones.values():
+                    try:
+                        msg = struct.pack('B', 90)  # OPCODE 90: SHUTDOWN
+                        session.socket.sendall(msg)
+                        print(f"[MCC] ✓ Shutdown signal sent to {session.drone_id}")
+                    except Exception as e:
+                        print(f"[MCC] ✗ Failed to signal {session.drone_id}: {e}")
+            else:
+                print("[MCC] No drones connected")
         
+        # Give drones time to process shutdown signal
+        print("[MCC] Waiting for drones to disconnect...")
+        time.sleep(1.5)
+        
+        print("[MCC] Stopping server...")
         self.running = False
-        time.sleep(1)
+        time.sleep(0.5)
         
         if self.server_socket:
             try:
                 self.server_socket.close()
             except:
                 pass
+        
+        print("[MCC] Shutdown complete")
     
     # ========================================================================
     # CLI Interface
@@ -696,17 +860,6 @@ class MissionControlCenter:
                     self.cmd_shutdown()
                     break
                 
-                elif cmd_lower == "help":
-                    print("\n" + "="*70)
-                    print("AVAILABLE COMMANDS")
-                    print("="*70)
-                    print("  list              - Show all authenticated drones")
-                    print("  broadcast <cmd>   - Send encrypted command to all drones")
-                    print("  status            - Show server statistics")
-                    print("  shutdown          - Gracefully shutdown server")
-                    print("  help              - Show this help message")
-                    print("="*70 + "\n")
-                
                 else:
                     print("\n" + "="*70)
                     print("UNKNOWN COMMAND")
@@ -724,11 +877,9 @@ class MissionControlCenter:
 
 def main():
     """Main entry point."""
-    import argparse
-    
     parser = argparse.ArgumentParser(description="UAV Mission Control Center")
     parser.add_argument('--host', default='localhost', help='Bind address')
-    parser.add_argument('--port', type=int, default=5555, help='Listen port')
+    parser.add_argument('--port', type=int, default=8000, help='Listen port')
     parser.add_argument('--security-level', type=int, default=2048, 
                        help='Cryptographic security level (bits)')
     

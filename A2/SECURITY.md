@@ -702,31 +702,66 @@ decrypt_and_execute()
 
 ### 9.1 Known Limitations
 
-1. **Clock Synchronization Requirement**
+1. **⚠️ CRITICAL: No Persistent Identity for Reconnecting Drones**
+   - **Root Cause**: Drones generate NEW ElGamal keypairs on EVERY connection (drone.py line 172)
+   - **Vulnerability**: After a legitimate drone disconnects, attacker can impersonate it:
+     1. Legitimate D004 connects → generates keypair₁ → authenticates → disconnects
+     2. Attacker connects with ID "D004" → generates keypair₂ → passes authentication
+     3. MCC cannot distinguish attacker from legitimate D004 (different keys each time)
+   - **Why Storing Key Doesn't Work**: Each connection uses different ephemeral keys
+   - **Current Protection**: Only prevents duplicate connections (same ID running simultaneously)
+   - **Attack Window**: Unlimited - works anytime after drone disconnects
+   - **Real-World Solution**: 
+     * Drones use PERSISTENT keypairs stored in secure hardware (TPM/HSM)
+     * Public keys registered offline via X.509 certificates signed by CA
+     * MCC verifies certificate chain, not ephemeral session keys
+   - **Status**: Unfixable without protocol redesign (ephemeral → persistent keys)
+
+2. **Clock Synchronization Requirement**
    - Relies on reasonably synchronized clocks
    - Skew > 5 seconds causes auth failure
    - Solution: NTP synchronization recommended
 
-2. **Public Key Infrastructure (PKI)**
+3. **Public Key Infrastructure (PKI)**
    - Assumes drone public keys are pre-registered
    - Current implementation uses simplified PKI
    - Production: integrate with certificate authority
 
-3. **Shared Secret Generation**
+4. **Shared Secret Generation**
    - Current: random integer generation
    - Assumes cryptographically secure random source
    - Requires entropy pool monitoring
 
-4. **No Perfect Forward Secrecy for Broadcast**
+5. **No Perfect Forward Secrecy for Broadcast**
    - Group key depends on all drone session keys
    - Compromise of one drone can affect GK
    - Mitigation: rotate GK frequently
 
 ### 9.2 Recommended Enhancements
 
-1. **Certificate-Based Authentication**
-   - Use X.509 certificates instead of raw public keys
-   - Integrate OCSP for revocation checking
+1. **🔒 PRIORITY: Persistent Identity & Certificate-Based Authentication**
+   - **Fix for Impersonation Vulnerability (#1 above)**:
+     * Implement persistent ElGamal keypairs stored in secure storage:
+       ```python
+       # drone.py - Load or generate persistent key
+       key_file = f'/secure/{drone_id}_keypair.bin'
+       if os.path.exists(key_file):
+           self.keypair = load_encrypted_keypair(key_file)
+       else:
+           self.keypair = generate_elgamal_keypair(p, g)
+           save_encrypted_keypair(key_file, self.keypair)
+       ```
+     * OR use X.509 certificates with CA-signed drone identities
+     * MCC stores drone public keys/certificates on first registration
+     * All subsequent connections verified against stored public key:
+       ```python
+       # mcc.py - Verify returning drone
+       stored_pubkey = self.registered_drones[drone_id]['public_key']
+       if not elgamal_verify(sig_r, sig_s, msg_hash, stored_pubkey, p, g):
+           print(f"IMPERSONATION DETECTED: {drone_id}")
+           return False
+       ```
+   - Integrate OCSP for certificate revocation checking
    - Add certificate pinning for critical drones
 
 2. **Perfect Forward Secrecy for Groups**

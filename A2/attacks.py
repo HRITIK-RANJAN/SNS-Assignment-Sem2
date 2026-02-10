@@ -1,571 +1,655 @@
-"""
-Secure UAV Command-and-Control System
-Security Attack Demonstrations
-
-Demonstrates various attacks and how the system defends against them.
-"""
-
 import socket
+import threading
 import struct
 import time
-import threading
-import random
+import sys
+
+# Import manual crypto primitives from your utils
 from crypto_utils import (
-    generate_large_prime, find_generator, generate_elgamal_keypair,
-    ElGamalKey, hash_sha256, hash_sha256_int, hmac_sha256, aes_encrypt,
-    int_to_bytes, int_to_bytes_variable, bytes_from_int_variable
+    generate_large_prime, 
+    generate_elgamal_keypair,
+    elgamal_sign,
+    hash_sha256_int,
+    int_to_bytes_variable, 
+    bytes_from_int_variable,
+    int_to_bytes
 )
 
+# Configuration
+REAL_MCC_HOST = 'localhost'
+REAL_MCC_PORT = 8000   # The actual MCC server
+PROXY_HOST = 'localhost'
+PROXY_PORT = 8001      # The port Drones should connect to
 
-# ============================================================================
-# Attack 1: Replay Attack
-# ============================================================================
+# Safety limits
+MAX_PACKET_SIZE = 10 * 1024 * 1024  # 10MB max packet size
 
-class ReplayAttack:
-    """Demonstrate replay attack on authentication."""
-    
-    def __init__(self, mcc_host='localhost', mcc_port=5555):
-        self.mcc_host = mcc_host
-        self.mcc_port = mcc_port
-        self.captured_phase1a = None
-    
-    def capture_authentication(self, drone_id):
-        """Capture a legitimate authentication request."""
-        print("\n[REPLAY ATTACK] Step 1: Capturing legitimate authentication...")
-        
-        # Create legitimate drone connection
-        socket_capture = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        
-        try:
-            socket_capture.connect((self.mcc_host, self.mcc_port))
-            
-            # Receive Phase 0
-            data = socket_capture.recv(8192)
-            print(f"[REPLAY ATTACK] Received Phase 0 from MCC ({len(data)} bytes)")
-            
-            # Receive Phase 1A request (MCC's Phase 1A response)
-            # Actually, let's just record what we would send
-            print(f"[REPLAY ATTACK] Captured authentication data for {drone_id}")
-            
-            socket_capture.close()
-            return True
-            
-        except Exception as e:
-            print(f"[REPLAY ATTACK] Capture error: {e}")
-            return False
-    
-    def perform_replay(self, drone_id):
-        """Replay the captured authentication."""
-        print("\n[REPLAY ATTACK] Step 2: Waiting 35 seconds before replay...")
-        time.sleep(35)
-        
-        print("[REPLAY ATTACK] Step 3: Attempting to replay authentication...")
-        
-        # Create new socket for replay
-        socket_replay = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        
-        try:
-            socket_replay.connect((self.mcc_host, self.mcc_port))
-            
-            # Receive Phase 0
-            data = socket_replay.recv(8192)
-            print(f"[REPLAY ATTACK] Received new Phase 0")
-            
-            # Send old Phase 1A data
-            print(f"[REPLAY ATTACK] Replaying old Phase 1A message...")
-            
-            # Simulate sending old authentication (would be captured in real scenario)
-            old_phase1a = struct.pack('B', 20)  # OPCODE 20
-            old_phase1a += struct.pack('>Q', int(time.time() * 1000) - 40000)  # Old timestamp (40s old)
-            old_phase1a += b'\x00' * 32  # Dummy nonce
-            old_phase1a += struct.pack('>I', len(drone_id)) + drone_id.encode('utf-8')
-            
-            # Add dummy encrypted data (c1, c2) - required by Phase 1A format
-            old_phase1a += int_to_bytes_variable(random.randint(1000, 10000))  # c1
-            old_phase1a += int_to_bytes_variable(random.randint(1000, 10000))  # c2
-            
-            # Add dummy signature (r, s) - required by Phase 1A format
-            old_phase1a += int_to_bytes_variable(random.randint(100, 1000))  # r
-            old_phase1a += int_to_bytes_variable(random.randint(100, 1000))  # s
-            
-            # Send with length prefix (MCC expects length-prefixed messages)
-            length_prefix = struct.pack('>I', len(old_phase1a))
-            socket_replay.sendall(length_prefix + old_phase1a)
-            
-            # Wait for response
-            time.sleep(2)
-            socket_replay.settimeout(3)
-            try:
-                response = socket_replay.recv(1024)
-                if response:
-                    opcode = struct.unpack('B', response[0:1])[0]
-                    if opcode == 60:
-                        print("[REPLAY ATTACK] ✓ MCC REJECTED replay due to old timestamp!")
-                        print("[REPLAY ATTACK]   Result: ATTACK PREVENTED")
-                        return True
-            except socket.timeout:
-                print("[REPLAY ATTACK] ✗ No response (might indicate acceptance)")
-                return False
-            
-        except Exception as e:
-            print(f"[REPLAY ATTACK] Replay error: {e}")
-        finally:
-            socket_replay.close()
-        
-        return False
-    
-    def run(self, drone_id):
-        """Run the replay attack demonstration."""
-        print("\n" + "="*70)
-        print("ATTACK 1: REPLAY ATTACK")
-        print("="*70)
-        print("Objective: Replay old authentication message to gain access")
-        print("Expected Defense: Timestamp validation")
-        
-        self.capture_authentication(drone_id)
-        self.perform_replay(drone_id)
-        
-        print("="*70 + "\n")
+# OPCODE Mapping (from PDF specification)
+OPCODES = {
+    10: "PARAM_INIT",
+    20: "AUTH_REQ",
+    30: "AUTH_RES",
+    40: "SK_CONFIRM",
+    50: "SUCCESS",
+    60: "ERR_MISMATCH",
+    70: "GROUP_KEY",
+    80: "GROUP_CMD"
+}
 
-
-# ============================================================================
-# Attack 2: Man-in-the-Middle Attack on Phase 0
-# ============================================================================
-
-class MitmAttack:
-    """Demonstrate MitM attack on parameter distribution."""
-    
-    def __init__(self, mcc_host='localhost', mcc_port=5555, 
-                 mitm_host='localhost', mitm_port=5556):
-        self.mcc_host = mcc_host
-        self.mcc_port = mcc_port
-        self.mitm_host = mitm_host
-        self.mitm_port = mitm_port
-        self.running = False
-    
-    def tamper_parameters(self, params_data):
-        """Tamper with MCC parameters."""
-        print("\n[MItM ATTACK] Tampering with parameters...")
-        
-        # Try to modify the prime p to a smaller/weaker value
-        print("[MItM ATTACK] Attempting to replace p with weak 512-bit prime...")
-        
-        # This would normally involve parsing and modifying the ElGamal params
-        # For demo purposes, we'll show the intention
-        weak_prime = generate_large_prime(512)
-        print(f"[MItM ATTACK] Generated weak prime: {weak_prime.bit_length()} bits")
-        print("[MItM ATTACK] Cannot re-sign with attacker's key (no private key)")
-        
-        return None  # Tampering failed due to signature requirement
-    
-    def run(self):
-        """Run the MitM attack demonstration."""
-        print("\n" + "="*70)
-        print("ATTACK 2: MAN-IN-THE-MIDDLE ATTACK (Phase 0)")
-        print("="*70)
-        print("Objective: Intercept and modify cryptographic parameters")
-        print("Expected Defense: Signature verification")
-        
-        print("\n[MItM ATTACK] Attempting to set up proxy attack...")
-        print("[MItM ATTACK] Step 1: Intercept MCC -> Drone connection")
-        print("[MItM ATTACK] Step 2: Receive Phase 0 parameters from MCC")
-        
-        # Simulate receiving parameters
-        print("[MItM ATTACK] Step 3: Modify parameters to weaken encryption")
-        weak_params = self.tamper_parameters(None)
-        
-        if weak_params is None:
-            print("[MItM ATTACK] ✓ Cannot re-sign tampered parameters!")
-            print("[MItM ATTACK] ✓ Drone will reject due to signature failure!")
-            print("[MItM ATTACK]   Result: ATTACK PREVENTED")
-        
-        print("[MItM ATTACK] Conclusion: Signature verification protects against tampering")
-        print("="*70 + "\n")
-
-
-# ============================================================================
-# Attack 3: Unauthorized Access
-# ============================================================================
-
-class UnauthorizedAccessAttack:
-    """Attempt unauthorized drone connection."""
-    
-    def __init__(self, mcc_host='localhost', mcc_port=5555):
-        self.mcc_host = mcc_host
-        self.mcc_port = mcc_port
-    
-    def run(self, attacker_id='ROGUE_DRONE'):
-        """Run unauthorized access attack."""
-        print("\n" + "="*70)
-        print("ATTACK 3: UNAUTHORIZED ACCESS")
-        print("="*70)
-        print("Objective: Connect to MCC with unknown/invalid drone ID")
-        print("Expected Defense: Unknown public key, signature verification")
-        
-        print(f"\n[UNAUTHORIZED] Attacker ID: {attacker_id}")
-        print("[UNAUTHORIZED] Step 1: Generate own keypair")
-        
-        p = generate_large_prime(512)  # Smaller for demo speed
-        g = find_generator(p)
-        keypair = generate_elgamal_keypair(p, g)
-        
-        print(f"[UNAUTHORIZED] Generated keypair with Y={keypair.y}")
-        
-        print("[UNAUTHORIZED] Step 2: Attempt connection to MCC")
-        
-        socket_attack = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        
-        try:
-            socket_attack.connect((self.mcc_host, self.mcc_port))
-            print("[UNAUTHORIZED] Connected to MCC")
-            
-            # Receive Phase 0
-            data = socket_attack.recv(8192)
-            print(f"[UNAUTHORIZED] Received Phase 0 from MCC")
-            
-            # Attempt Phase 1A with unknown ID
-            print("[UNAUTHORIZED] Step 3: Sending Phase 1A with unknown ID")
-            
-            phase1a = struct.pack('B', 20)  # OPCODE 20
-            phase1a += struct.pack('>Q', int(time.time() * 1000))  # Current timestamp
-            phase1a += b'\x00' * 32  # Dummy nonce
-            phase1a += struct.pack('>I', len(attacker_id)) + attacker_id.encode('utf-8')
-            
-            # Add dummy encrypted data (c1, c2)
-            phase1a += int_to_bytes_variable(random.randint(1000, 10000))  # c1
-            phase1a += int_to_bytes_variable(random.randint(1000, 10000))  # c2
-            
-            # Add dummy signature (r, s)
-            phase1a += int_to_bytes_variable(random.randint(100, 1000))  # r
-            phase1a += int_to_bytes_variable(random.randint(100, 1000))  # s
-            
-            # Send with length prefix
-            length_prefix = struct.pack('>I', len(phase1a))
-            socket_attack.sendall(length_prefix + phase1a)
-            print("[UNAUTHORIZED] Sent Phase 1A")
-            
-            # Wait for response
-            time.sleep(2)
-            socket_attack.settimeout(5)
-            
-            try:
-                response = socket_attack.recv(1024)
-                print(f"[UNAUTHORIZED] MCC Response: {len(response)} bytes")
-                
-                if len(response) > 0:
-                    opcode = struct.unpack('B', response[0:1])[0]
-                    if opcode == 60:
-                        print("[UNAUTHORIZED] ✓ MCC REJECTED connection!")
-                        print("[UNAUTHORIZED]   Reason: Invalid signature verification")
-                        print("[UNAUTHORIZED]   Result: ATTACK PREVENTED")
-                    elif opcode == 30:
-                        print("[UNAUTHORIZED] ✗ MCC accepted connection (should not happen)")
-                    else:
-                        print(f"[UNAUTHORIZED] MCC sent opcode: {opcode}")
-                else:
-                    print("[UNAUTHORIZED] ✓ MCC closed connection")
-                    print("[UNAUTHORIZED]   Result: ATTACK PREVENTED")
-            
-            except socket.timeout:
-                print("[UNAUTHORIZED] ✓ Connection timeout (MCC rejected)")
-                print("[UNAUTHORIZED]   Result: ATTACK PREVENTED")
-            
-        except Exception as e:
-            print(f"[UNAUTHORIZED] Connection error: {e}")
-            print("[UNAUTHORIZED] ✓ Attack failed")
-        
-        finally:
-            socket_attack.close()
-        
-        print("="*70 + "\n")
-
-
-# ============================================================================
-# Attack 4: Message Tampering Detection
-# ============================================================================
-
-class MessageTamperingAttack:
-    """Demonstrate HMAC-based message tampering detection."""
+class AttackEngine:
+    """
+    MITM Proxy with dynamic attack capabilities.
+    By default: Transparent forwarding (invisible to drone and MCC).
+    When armed: Intercepts next matching packet, then resets to NORMAL.
+    """
     
     def __init__(self):
-        pass
-    
-    def run(self):
-        """Run message tampering demonstration."""
-        print("\n" + "="*70)
-        print("ATTACK 4: MESSAGE TAMPERING")
-        print("="*70)
-        print("Objective: Modify broadcast command and avoid detection")
-        print("Expected Defense: HMAC authentication")
-        
-        # Simulate original command
-        session_key = hash_sha256(b"test_session_key_material")
-        original_command = b"RETURN_TO_BASE"
-        
-        print(f"\n[TAMPERING] Original command: {original_command.decode()}")
-        
-        # Encrypt command
-        iv, encrypted = aes_encrypt(session_key, original_command)
-        original_hmac = hmac_sha256(session_key, encrypted)
-        
-        print(f"[TAMPERING] HMAC: {original_hmac.hex()[:32]}...")
-        
-        # Attacker tampers with ciphertext
-        print("\n[TAMPERING] Attacker modifies ciphertext...")
-        tampered_encrypted = bytes([encrypted[0] ^ 0xFF]) + encrypted[1:]
-        
-        # Recompute HMAC on tampered data
-        tampered_hmac = hmac_sha256(session_key, tampered_encrypted)
-        
-        print(f"[TAMPERING] Tampered ciphertext HMAC: {tampered_hmac.hex()[:32]}...")
-        
-        # Compare
-        print("\n[TAMPERING] Step: Verify HMAC")
-        if tampered_hmac == original_hmac:
-            print("[TAMPERING] ✗ Tampering not detected (should not happen)")
-        else:
-            print("[TAMPERING] ✓ HMAC mismatch detected!")
-            print("[TAMPERING]   Result: ATTACK PREVENTED")
-        
-        print("="*70 + "\n")
+        self.attack_mode = "NORMAL"  # NORMAL, REPLAY, TAMPER
+        self.running = True
+        self.proxy_socket = None
+        self.attack_lock = threading.Lock()  # For thread-safe attack state
+        self.control_socket = None  # Connection to MCC for shutdown signals
+        self.drone_connections = []  # Track all active drone proxy connections
+        self.connections_lock = threading.Lock()  # Protect drone connections list
 
+    def log(self, tag, message):
+        """Enhanced logging with timestamps."""
+        timestamp = time.strftime("%H:%M:%S")
+        print(f"[{timestamp}] [{tag}] {message}")
 
-# ============================================================================
-# Attack 5: Drone Impersonation
-# ============================================================================
-
-class DroneImpersonationAttack:
-    """Attempt to impersonate a legitimate drone."""
+    def get_opcode_name(self, opcode):
+        """Get human-readable opcode name."""
+        return OPCODES.get(opcode, f"UNKNOWN_{opcode}")
     
-    def __init__(self, mcc_host='localhost', mcc_port=5555):
-        self.mcc_host = mcc_host
-        self.mcc_port = mcc_port
+    def recv_exact(self, sock, size):
+        """
+        Receive exactly 'size' bytes from socket.
+        Returns bytes if successful, None if connection closed.
+        """
+        data = b''
+        while len(data) < size:
+            chunk = sock.recv(size - len(data))
+            if not chunk:
+                return None  # Connection closed
+            data += chunk
+        return data
     
-    def run(self, target_drone_id='D001'):
-        """Run impersonation attack."""
-        print("\n" + "="*70)
-        print("ATTACK 5: DRONE IMPERSONATION")
-        print("="*70)
-        print(f"Objective: Impersonate legitimate drone {target_drone_id}")
-        print("Expected Defense: Digital signatures and PKI")
+    # ========================================================================
+    # BIDIRECTIONAL FORWARDING HANDLERS (A1-Style Architecture)
+    # ========================================================================
+    
+    def handle_drone_to_mcc(self, drone_socket, mcc_socket, addr):
+        """
+        Forward packets from Drone -> MCC.
+        Intercept opportunities: Phase 1A (REPLAY)
         
-        print(f"\n[IMPERSONATION] Target: {target_drone_id}")
-        print("[IMPERSONATION] Step 1: Generate rogue keypair")
+        Protocol framing:
+        - Messages 1-2 (Phase 1A, Phase 2): length-prefixed (4-byte header)
+        - After that: raw byte forwarding (drone sends nothing more normally)
+        """
+        try:
+            msg_count = 0
+            while self.running:
+                if msg_count < 2:
+                    # --- LENGTH-PREFIXED PHASE (Phase 1A + Phase 2) ---
+                    header = self.recv_exact(drone_socket, 4)
+                    if not header:
+                        return
+                    
+                    length = struct.unpack('>I', header)[0]
+                    if length == 0 or length > MAX_PACKET_SIZE:
+                        self.log("ERROR", f"Invalid packet size: {length}")
+                        return
+                    
+                    payload = self.recv_exact(drone_socket, length)
+                    if not payload:
+                        return
+                    
+                    opcode = payload[0]
+                    
+                    # REPLAY ATTACK: Capture Phase 1A (opcode 20)
+                    with self.attack_lock:
+                        current_mode = self.attack_mode
+                    
+                    if opcode == 20 and current_mode == "REPLAY":
+                        with self.attack_lock:
+                            self.attack_mode = "NORMAL"
+                        self.log("ATTACK", "REPLAY triggered")
+                        self.handle_replay_attack(header + payload, mcc_socket)
+                    else:
+                        mcc_socket.sendall(header + payload)
+                    
+                    msg_count += 1
+                else:
+                    # --- RAW FORWARDING (post-authentication) ---
+                    data = drone_socket.recv(4096)
+                    if not data:
+                        return
+                    mcc_socket.sendall(data)
+                
+        except Exception as e:
+            pass
+        finally:
+            for sock in [drone_socket, mcc_socket]:
+                try:
+                    sock.close()
+                except:
+                    pass
+    
+    def handle_mcc_to_drone(self, mcc_socket, drone_socket):
+        """
+        Forward packets from MCC -> Drone.
+        Intercept opportunities: Phase 0 (TAMPER)
         
-        p = generate_large_prime(512)
-        g = find_generator(p)
-        rogue_keypair = generate_elgamal_keypair(p, g)
+        Protocol framing:
+        - Messages 1-2 (Phase 0, Phase 1B): length-prefixed (4-byte header)
+        - After that: raw byte forwarding (Phase 2 response + Phase 3 are NOT length-prefixed)
+        """
+        try:
+            msg_count = 0
+            while self.running:
+                if msg_count < 2:
+                    # --- LENGTH-PREFIXED PHASE (Phase 0 + Phase 1B) ---
+                    header = self.recv_exact(mcc_socket, 4)
+                    if not header:
+                        return
+                    
+                    length = struct.unpack('>I', header)[0]
+                    if length == 0 or length > MAX_PACKET_SIZE:
+                        self.log("ERROR", f"Invalid packet size: {length}")
+                        return
+                    
+                    payload = self.recv_exact(mcc_socket, length)
+                    if not payload:
+                        return
+                    
+                    opcode = payload[0]
+                    
+                    # TAMPER ATTACK: Modify Phase 0 (opcode 10)
+                    with self.attack_lock:
+                        current_mode = self.attack_mode
+                    
+                    if opcode == 10 and current_mode == "TAMPER":
+                        with self.attack_lock:
+                            self.attack_mode = "NORMAL"
+                        self.log("ATTACK", "TAMPER triggered")
+                        self.handle_tamper_attack(header, payload, drone_socket)
+                    else:
+                        drone_socket.sendall(header + payload)
+                    
+                    msg_count += 1
+                else:
+                    # --- RAW FORWARDING (Phase 2 response + Phase 3) ---
+                    # Phase 2 response (opcode 50/60) is just 1 byte - NO length prefix
+                    # Phase 3 messages (opcodes 70, 80, 90) are also NOT length-prefixed
+                    data = mcc_socket.recv(4096)
+                    if not data:
+                        return
+                    drone_socket.sendall(data)
+                
+        except Exception as e:
+            pass
+        finally:
+            for sock in [mcc_socket, drone_socket]:
+                try:
+                    sock.close()
+                except:
+                    pass
+    
+    # ========================================================================
+    # ATTACK IMPLEMENTATIONS
+    # ========================================================================
+    
+    def handle_replay_attack(self, packet_data, mcc_socket):
+        """
+        REPLAY ATTACK on Phase 1A:
+        1. Forward packet immediately (so legitimate drone still authenticates)
+        2. Wait 7 seconds (exceeds MCC's 5-30s timestamp window)
+        3. Replay packet on a NEW connection to MCC
+        4. Check if MCC accepts or rejects the stale packet
+        """
+        self.log("REPLAY", "Forwarding original packet...")
         
-        print(f"[IMPERSONATION] Generated rogue keypair")
+        # 1. Forward original packet immediately
+        try:
+            mcc_socket.sendall(packet_data)
+        except Exception as e:
+            self.log("ERROR", f"Failed to forward original: {e}")
+            return
         
-        print("[IMPERSONATION] Step 2: Attempt connection as target drone")
+        # 2. Spawn background thread for delayed replay
+        def replay_thread():
+            self.log("REPLAY", "Waiting 7s...")
+            time.sleep(7)
+            
+            self.log("REPLAY", "Replaying on new connection...")
+            try:
+                # Open fresh connection to MCC
+                replay_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                replay_sock.settimeout(10.0)
+                replay_sock.connect((REAL_MCC_HOST, REAL_MCC_PORT))
+                
+                # Receive Phase 0 parameters (required MCC handshake)
+                phase0_header = b''
+                while len(phase0_header) < 4:
+                    chunk = replay_sock.recv(4 - len(phase0_header))
+                    if not chunk:
+                        raise ConnectionError("Connection closed during Phase 0")
+                    phase0_header += chunk
+                
+                phase0_len = struct.unpack('>I', phase0_header)[0]
+                if phase0_len > 0 and phase0_len < MAX_PACKET_SIZE:
+                    phase0_data = b''
+                    while len(phase0_data) < phase0_len:
+                        chunk = replay_sock.recv(phase0_len - len(phase0_data))
+                        if not chunk:
+                            raise ConnectionError("Connection closed during Phase 0 payload")
+                        phase0_data += chunk
+                
+                # Send the captured (now stale) Phase 1A packet
+                replay_sock.sendall(packet_data)
+                
+                # Wait for MCC response
+                replay_sock.settimeout(5.0)
+                resp_header = b''
+                while len(resp_header) < 4:
+                    chunk = replay_sock.recv(4 - len(resp_header))
+                    if not chunk:
+                        self.log("SUCCESS", "✓ Replay REJECTED (connection closed)")
+                        replay_sock.close()
+                        return
+                    resp_header += chunk
+                
+                resp_len = struct.unpack('>I', resp_header)[0]
+                response = resp_header + replay_sock.recv(resp_len if resp_len < 1024 else 1024)
+                
+                if not response:
+                    self.log("SUCCESS", "✓ Replay REJECTED (connection closed)")
+                else:
+                    # Parse response opcode
+                    if len(response) >= 5:
+                        resp_opcode = response[4]  # Skip 4-byte length header
+                        if resp_opcode == 60:  # ERR_MISMATCH
+                            self.log("SUCCESS", "✓ Replay REJECTED (error response)")
+                        elif resp_opcode == 30:  # AUTH_RES
+                            self.log("FAILURE", "✗ Replay ACCEPTED (vulnerability!)")
+                        else:
+                            self.log("REPLAY", f"Opcode: {resp_opcode}")
+                
+                replay_sock.close()
+                
+            except socket.timeout:
+                self.log("SUCCESS", "✓ Replay REJECTED (timeout)")
+            except Exception as e:
+                self.log("ERROR", f"Replay failed: {e}")
         
-        socket_rogue = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        threading.Thread(target=replay_thread, daemon=True).start()
+    
+    def handle_tamper_attack(self, header, payload, drone_socket):
+        """
+        TAMPER ATTACK on Phase 0:
+        1. Parse Phase 0 parameters (P, G, SL, TS, ID, Y, Sig)
+        2. Replace P with a WEAK prime (e.g., 23 or 512-bit)
+        3. Keep signature INVALID (to test signature verification)
+        4. Forward corrupted packet to drone
+        5. Drone should reject due to signature verification failure
+        """
         
         try:
-            socket_rogue.connect((self.mcc_host, self.mcc_port))
-            print("[IMPERSONATION] Connected to MCC")
+            # Parse original parameters
+            offset = 1  # Skip opcode
+            orig_p, offset = bytes_from_int_variable(payload, offset)
             
-            # Receive Phase 0
-            data = socket_rogue.recv(8192)
-            print("[IMPERSONATION] Received MCC parameters")
+            # Generate weak prime (fast for demo)
+            weak_p = 23  # Extremely weak (5-bit prime)
+            weak_p_bytes = int_to_bytes_variable(weak_p)
             
-            # Send Phase 1A as target drone
-            print(f"[IMPERSONATION] Sending Phase 1A as {target_drone_id}")
+            # Reconstruct packet with weak P
+            # Structure: Opcode(1) + P(var) + [rest of original packet]
+            remaining = payload[offset:]
             
-            phase1a = struct.pack('B', 20)  # OPCODE 20
-            phase1a += struct.pack('>Q', int(time.time() * 1000))  # Current timestamp
-            phase1a += b'\x00' * 32  # Dummy nonce
+            new_payload = bytearray([10])  # Opcode PHASE_0_PARAMS
+            new_payload += weak_p_bytes
+            new_payload += remaining
             
-            drone_id_bytes = target_drone_id.encode('utf-8')
-            phase1a += struct.pack('>I', len(drone_id_bytes)) + drone_id_bytes
+            # Recalculate length header
+            new_header = struct.pack('>I', len(new_payload))
             
-            # Add encrypted data and signature (using rogue key)
-            phase1a += int_to_bytes_variable(random.randint(1000, 10000))  # c1
-            phase1a += int_to_bytes_variable(random.randint(1000, 10000))  # c2
-            phase1a += int_to_bytes_variable(random.randint(100, 1000))  # r
-            phase1a += int_to_bytes_variable(random.randint(100, 1000))  # s
+            self.log("TAMPER", f"Replaced P: {orig_p.bit_length()}-bit → {weak_p.bit_length()}-bit")
+            
+            # Forward tampered packet
+            drone_socket.sendall(new_header + bytes(new_payload))
+            
+        except Exception as e:
+            self.log("ERROR", f"Tamper attack failed: {e}")
+            # Fallback: forward original
+            drone_socket.sendall(header + payload)
+    
+    # ========================================================================
+    # STANDALONE ATTACKS (Separate Connections)
+    # ========================================================================
+    
+    def run_unauthorized_access_suite(self):
+        """
+        Attack suite testing MCC's defense layers:
+        - Registry Validation (Unknown Drone ID)
+        """
+        print("="*70)
+        print("   UNAUTHORIZED ACCESS ATTACK SUITE")
+        print("="*70)
+        
+        # Attack: Unknown Drone ID (outside D001-D100 registry)
+        print("\nRegistry Validation Test")
+        print("-" * 70)
+        print("Testing with unregistered ID: DRONE_666 (not in D001-D100 range)")
+        self.attack_unknown_id()
+        
+        print("\n" + "="*70 + "\n")
+    
+    def attack_unknown_id(self, fake_id="DRONE_666"):
+        """
+        Test MCC's registry validation by connecting with unregistered ID.
+        MCC registry contains D001-D100, so DRONE_666 is outside valid range.
+        Expected: MCC rejects due to unknown drone ID.
+        """
+        self.log("TEST", f"Unregistered ID: {fake_id} (not in D001-D100 registry)")
+        
+        try:
+            # Generate valid cryptographic parameters
+            fake_p = generate_large_prime(512)
+            fake_g = 2
+            fake_keypair = generate_elgamal_keypair(fake_p, fake_g)
+            
+            # Connect to MCC
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10.0)
+            sock.connect((REAL_MCC_HOST, REAL_MCC_PORT))
+            
+            # Receive Phase 0 (length-prefixed)
+            header = b''
+            while len(header) < 4:
+                chunk = sock.recv(4 - len(header))
+                if not chunk:
+                    raise ConnectionError("Connection closed")
+                header += chunk
+            
+            length = struct.unpack('>I', header)[0]
+            if length > 0 and length < MAX_PACKET_SIZE:
+                phase0 = b''
+                while len(phase0) < length:
+                    chunk = sock.recv(length - len(phase0))
+                    if not chunk:
+                        raise ConnectionError("Connection closed")
+                    phase0 += chunk
+            
+            # Craft Phase 1A with UNREGISTERED ID
+            ts = int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF
+            nonce = b'\xBB' * 32
+            drone_id_bytes = fake_id.encode('utf-8')
+            
+            # Dummy encrypted secret
+            c1_dummy, c2_dummy = 99999, 88888
+            
+            # Build Phase 1A message
+            msg_1a = struct.pack('>Q', ts)
+            msg_1a += nonce
+            msg_1a += struct.pack('>I', len(drone_id_bytes)) + drone_id_bytes
+            msg_1a += int_to_bytes_variable(c1_dummy) + int_to_bytes_variable(c2_dummy)
+            
+            # Sign with fake key
+            msg_hash = hash_sha256_int(msg_1a) % (fake_keypair.p - 1)
+            r, s = elgamal_sign(msg_hash, fake_keypair)
+            
+            # Pack full packet
+            full_packet = struct.pack('B', 20)  # Opcode PHASE_1A
+            full_packet += msg_1a
+            full_packet += int_to_bytes_variable(r) + int_to_bytes_variable(s)
             
             # Send with length prefix
-            length_prefix = struct.pack('>I', len(phase1a))
-            socket_rogue.sendall(length_prefix + phase1a)
+            length_header = struct.pack('>I', len(full_packet))
+            sock.sendall(length_header + full_packet)
             
-            print("[IMPERSONATION] Awaiting response...")
-            time.sleep(2)
-            socket_rogue.settimeout(5)
+            # Wait for response
+            response = sock.recv(1024)
             
-            try:
-                response = socket_rogue.recv(1024)
-                if response:
-                    opcode = struct.unpack('B', response[0:1])[0]
-                    if opcode == 60:
-                        print("[IMPERSONATION] ✓ MCC REJECTED impersonation!")
-                        print("[IMPERSONATION]   Reason: Signature verification failed")
-                        print("[IMPERSONATION]   Result: ATTACK PREVENTED")
-                    elif opcode == 30:
-                        print("[IMPERSONATION] ✗ MCC accepted (vulnerability)")
-                    else:
-                        print(f"[IMPERSONATION] Received opcode: {opcode}")
+            if not response:
+                self.log("SUCCESS", "✓ Unknown ID REJECTED")
+            elif len(response) > 4:
+                opcode = response[4]
+                if opcode == 60:  # ERR_MISMATCH
+                    self.log("SUCCESS", "✓ Unknown ID REJECTED")
+                elif opcode == 30:  # AUTH_RES
+                    self.log("FAILURE", "✗ Unknown ID ACCEPTED")
+                else:
+                    self.log("TEST", f"Opcode: {opcode}")
             
-            except socket.timeout:
-                print("[IMPERSONATION] ✓ Connection timeout")
-                print("[IMPERSONATION]   Result: ATTACK PREVENTED")
-        
+            sock.close()
+            
         except Exception as e:
-            print(f"[IMPERSONATION] Error: {e}")
-        
-        finally:
-            socket_rogue.close()
-        
-        print("="*70 + "\n")
-
-
-# ============================================================================
-# Main Attack Demonstration
-# ============================================================================
-
-def run_all_attacks(mcc_host='localhost', mcc_port=5555):
-    """Run all security attack demonstrations."""
-    print("\n" + "="*70)
-    print("SECURE UAV C2 SYSTEM - SECURITY ATTACK DEMONSTRATIONS")
-    print("="*70)
-    print(f"Target MCC: {mcc_host}:{mcc_port}")
-    print("="*70)
+            self.log("ERROR", f"Attack failed: {e}")
     
-    # Attack 1: Replay Attack
-    print("\nAttempting Attack 1: Replay Attack...")
-    replay = ReplayAttack(mcc_host, mcc_port)
-    replay.run('D001')
+    # ========================================================================
+    # PROXY SERVER
+    # ========================================================================
     
-    # Attack 2: MitM Attack
-    print("\nAttempting Attack 2: Man-in-the-Middle Attack...")
-    mitm = MitmAttack(mcc_host, mcc_port)
-    mitm.run()
-    
-    # Attack 3: Unauthorized Access
-    print("\nAttempting Attack 3: Unauthorized Access...")
-    unauth = UnauthorizedAccessAttack(mcc_host, mcc_port)
-    unauth.run('ROGUE_DRONE')
-    
-    # Attack 4: Message Tampering
-    print("\nAttempting Attack 4: Message Tampering...")
-    tamper = MessageTamperingAttack()
-    tamper.run()
-    
-    # Attack 5: Drone Impersonation
-    print("\nAttempting Attack 5: Drone Impersonation...")
-    imperson = DroneImpersonationAttack(mcc_host, mcc_port)
-    imperson.run('D001')
-    
-    print("\n" + "="*70)
-    print("ATTACK DEMONSTRATIONS COMPLETED")
-    print("="*70)
-    print("\nSummary: All attacks were successfully prevented by:")
-    print("  1. Timestamp validation")
-    print("  2. Digital signature verification")
-    print("  3. HMAC-based message authentication")
-    print("  4. Mutual authentication protocols")
-    print("="*70 + "\n")
-
-
-def interactive_menu(mcc_host='localhost', mcc_port=5555):
-    """Interactive attack menu where user can select attacks."""
-    print("\n" + "="*70)
-    print("SECURE UAV C2 SYSTEM - INTERACTIVE ATTACK DEMONSTRATION")
-    print("="*70)
-    print(f"Target MCC: {mcc_host}:{mcc_port}")
-    print("="*70)
-    
-    # Initialize attack objects
-    replay = ReplayAttack(mcc_host, mcc_port)
-    mitm = MitmAttack(mcc_host, mcc_port)
-    unauth = UnauthorizedAccessAttack(mcc_host, mcc_port)
-    tamper = MessageTamperingAttack()
-    imperson = DroneImpersonationAttack(mcc_host, mcc_port)
-    
-    while True:
-        print("\n" + "="*70)
-        print("ATTACK MENU")
-        print("="*70)
-        print("Available Attacks:")
-        print("  [r] - Replay Attack")
-        print("  [m] - Man-in-the-Middle (MITM) Attack")
-        print("  [u] - Unauthorized Access Attack")
-        print("  [t] - Message Tampering Attack")
-        print("  [i] - Drone Impersonation Attack")
-        print("  [a] - Run All Attacks Sequentially")
-        print("  [q] - Quit")
-        print("="*70)
-        
-        choice = input("\nSelect attack [r/m/u/t/i/a/q]: ").strip().lower()
-        
-        if choice == 'r':
-            print("\n[*] Launching Replay Attack...")
-            replay.run('D001')
-        
-        elif choice == 'm':
-            print("\n[*] Launching Man-in-the-Middle Attack...")
-            mitm.run()
-        
-        elif choice == 'u':
-            print("\n[*] Launching Unauthorized Access Attack...")
-            unauth.run('ROGUE_DRONE')
-        
-        elif choice == 't':
-            print("\n[*] Launching Message Tampering Attack...")
-            tamper.run()
-        
-        elif choice == 'i':
-            print("\n[*] Launching Drone Impersonation Attack...")
-            imperson.run('D001')
-        
-        elif choice == 'a':
-            print("\n[*] Launching All Attacks Sequentially...")
-            run_all_attacks(mcc_host, mcc_port)
-        
-        elif choice == 'q':
-            print("\n[*] Exiting Attack Demonstration...")
-            print("="*70 + "\n")
-            break
-        
-        else:
-            print("\n[!] Invalid choice. Please select a valid option.")
-
-
-def main():
-    """Main entry point."""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Security Attack Demonstrations")
-    parser.add_argument('--mcc-host', default='localhost', help='MCC host')
-    parser.add_argument('--mcc-port', type=int, default=5555, help='MCC port')
-    parser.add_argument('--auto', action='store_true', 
-                       help='Run all attacks automatically (non-interactive)')
-    
-    args = parser.parse_args()
-    
-    # Wait for MCC to be ready
-    print("Waiting for MCC to be ready...")
-    for attempt in range(10):
+    def listen_for_mcc_shutdown(self):
+        """
+        Listen for shutdown signal from MCC.
+        When MCC shuts down, it closes this control connection.
+        """
         try:
-            test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            test_socket.settimeout(2)
-            test_socket.connect((args.mcc_host, args.mcc_port))
-            test_socket.close()
-            print("✓ MCC is ready")
-            break
-        except:
-            if attempt == 9:
-                print("✗ MCC not responding - make sure it's running")
-                return
-            time.sleep(1)
+            # Connect to MCC as control client
+            self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.control_socket.connect((REAL_MCC_HOST, REAL_MCC_PORT))
+            
+            # Send control connection opcode
+            self.control_socket.sendall(struct.pack('B', 98))
+            self.log("CONTROL", f"Control connection established with MCC")
+            
+            # Wait for shutdown signal or connection close
+            while self.running:
+                try:
+                    self.control_socket.settimeout(1.0)
+                    data = self.control_socket.recv(1024)
+                    if not data:
+                        # MCC closed connection - shutdown signal
+                        self.log("CONTROL", "MCC shutdown detected")
+                        self.shutdown_all()
+                        break
+                    
+                    # Check for explicit shutdown opcode
+                    if data[0] == 99:
+                        self.log("CONTROL", "Shutdown signal received from MCC")
+                        self.shutdown_all()
+                        break
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    self.log("CONTROL", f"Connection lost: {e}")
+                    self.shutdown_all()
+                    break
+        
+        except ConnectionRefusedError:
+            self.log("CONTROL", "MCC not available for control connection")
+        except Exception as e:
+            self.log("CONTROL", f"Control connection error: {e}")
     
-    # Run attacks
-    if args.auto:
-        run_all_attacks(args.mcc_host, args.mcc_port)
-    else:
-        interactive_menu(args.mcc_host, args.mcc_port)
+    def shutdown_all(self):
+        """
+        Shutdown all proxy connections, which will disconnect all drones.
+        """
+        self.log("SHUTDOWN", "Closing all drone connections...")
+        self.running = False
+        
+        # Close all drone proxy connections
+        with self.connections_lock:
+            for drone_sock, mcc_sock in self.drone_connections:
+                try:
+                    drone_sock.close()
+                except:
+                    pass
+                try:
+                    mcc_sock.close()
+                except:
+                    pass
+            self.drone_connections.clear()
+        
+        # Close proxy server
+        if self.proxy_socket:
+            try:
+                self.proxy_socket.close()
+            except:
+                pass
+        
+        self.log("SHUTDOWN", "All connections closed")
+    
+    def start_proxy(self):
+        """
+        Main proxy server loop.
+        Accepts drone connections and spawns bidirectional forwarding threads.
+        """
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.proxy_socket = server
+        
+        try:
+            server.bind((PROXY_HOST, PROXY_PORT))
+        except OSError as e:
+            self.log("ERROR", f"Bind failed on port {PROXY_PORT}: {e}")
+            return
+        
+        server.listen(10)
+        server.settimeout(1.0)  # Non-blocking accept
+        self.log("PROXY", f"Listening on {PROXY_HOST}:{PROXY_PORT}")
+        self.log("PROXY", f"Forwarding to {REAL_MCC_HOST}:{REAL_MCC_PORT}")
+        print()
+        
+        while self.running:
+            try:
+                # Accept drone connection
+                try:
+                    drone_sock, addr = server.accept()
+                except socket.timeout:
+                    continue
+                
+                # Connect to real MCC
+                mcc_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    mcc_sock.connect((REAL_MCC_HOST, REAL_MCC_PORT))
+                except Exception as e:
+                    self.log("ERROR", f"MCC connection failed: {e}")
+                    drone_sock.close()
+                    continue
+                
+                # Track this connection
+                with self.connections_lock:
+                    self.drone_connections.append((drone_sock, mcc_sock))
+                
+                # Start bidirectional forwarding threads (A1-style)
+                t1 = threading.Thread(
+                    target=self.handle_drone_to_mcc,
+                    args=(drone_sock, mcc_sock, addr),
+                    daemon=True
+                )
+                t2 = threading.Thread(
+                    target=self.handle_mcc_to_drone,
+                    args=(mcc_sock, drone_sock),
+                    daemon=True
+                )
+                
+                t1.start()
+                t2.start()
+                
+            except OSError:
+                break
+            except Exception as e:
+                if self.running:
+                    self.log("ERROR", f"Proxy error: {e}")
+        
+        server.close()
+        self.log("PROXY", "Proxy server stopped")
 
+
+# ============================================================================
+# CLI INTERFACE
+# ============================================================================
+
+def print_banner():
+    """Print attack suite banner."""
+    print("\n" + "="*70)
+    print("   SECURE UAV ATTACK SUITE - MITM PROXY")
+    print("="*70)
+
+def print_menu(engine):
+    """Print interactive menu."""
+    print(f"\n{'─'*70}")
+    print(f"  Mode: {engine.attack_mode}")
+    print(f"{'─'*70}")
+    print("  [1] REPLAY ATTACK       - Capture & replay Phase 1A")
+    print("  [2] TAMPER ATTACK       - Modify Phase 0 parameters")
+    print("  [3] UNAUTHORIZED        - Test registry validation")
+    print("  [q] QUIT")
+    print(f"{'─'*70}")
+
+def input_listener(engine):
+    """
+    CLI thread for interactive attack control.
+    Runs in parallel with proxy server.
+    """
+    time.sleep(0.5)  # Let proxy start first
+    print_banner()
+    
+    while engine.running:
+        print_menu(engine)
+        print()
+        try:
+            choice = input("Select Option > ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            break
+        
+        if choice == '1':
+            with engine.attack_lock:
+                engine.attack_mode = "REPLAY"
+            print("\n✓ REPLAY armed (triggers on next Phase 1A)\n")
+            
+        elif choice == '2':
+            with engine.attack_lock:
+                engine.attack_mode = "TAMPER"
+            print("\n✓ TAMPER armed (triggers on next Phase 0)\n")
+            
+        elif choice == '3':
+            print()
+            engine.run_unauthorized_access_suite()
+            
+        elif choice == 'q':
+            print("\n✓ Shutting down...")
+            engine.shutdown_all()
+            break
+            
+        else:
+            print("\n✗ Invalid\n")
+
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
 
 if __name__ == "__main__":
-    main()
+    engine = AttackEngine()
+    
+    # Start control connection listener (monitors MCC shutdown)
+    control_thread = threading.Thread(target=engine.listen_for_mcc_shutdown, daemon=True)
+    control_thread.start()
+    
+    # Start proxy server in background thread
+    proxy_thread = threading.Thread(target=engine.start_proxy, daemon=True)
+    proxy_thread.start()
+    
+    # Run CLI in main thread
+    try:
+        input_listener(engine)
+    except KeyboardInterrupt:
+        print("\n\n✓ Interrupted")
+    finally:
+        engine.shutdown_all()
+        sys.exit(0)
