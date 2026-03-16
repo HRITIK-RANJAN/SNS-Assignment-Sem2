@@ -33,7 +33,9 @@ OPCODES = {
     50: "SUCCESS",
     60: "ERR_MISMATCH",
     70: "GROUP_KEY",
-    80: "GROUP_CMD"
+    80: "GROUP_CMD",
+    90: "SHUTDOWN",
+    95: "DISCONNECT"
 }
 
 class AttackEngine:
@@ -434,45 +436,54 @@ class AttackEngine:
     
     def listen_for_mcc_shutdown(self):
         """
-        Listen for shutdown signal from MCC.
-        When MCC shuts down, it closes this control connection.
+        Listen for status updates from MCC.
+        Proxy continues running independently even if MCC shuts down.
         """
-        try:
-            # Connect to MCC as control client
-            self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.control_socket.connect((REAL_MCC_HOST, REAL_MCC_PORT))
-            
-            # Send control connection opcode
-            self.control_socket.sendall(struct.pack('B', 98))
-            self.log("CONTROL", f"Control connection established with MCC")
-            
-            # Wait for shutdown signal or connection close
-            while self.running:
-                try:
-                    self.control_socket.settimeout(1.0)
-                    data = self.control_socket.recv(1024)
-                    if not data:
-                        # MCC closed connection - shutdown signal
-                        self.log("CONTROL", "MCC shutdown detected")
-                        self.shutdown_all()
+        while self.running:
+            try:
+                # Connect to MCC as control client
+                self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.control_socket.connect((REAL_MCC_HOST, REAL_MCC_PORT))
+                
+                # Send control connection opcode
+                self.control_socket.sendall(struct.pack('B', 98))
+                self.log("CONTROL", f"Control connection established with MCC")
+                
+                # Monitor connection status
+                while self.running:
+                    try:
+                        self.control_socket.settimeout(1.0)
+                        data = self.control_socket.recv(1024)
+                        if not data:
+                            # MCC closed connection - it's shut down
+                            self.log("CONTROL", "MCC connection closed - MCC has shut down")
+                            self.log("CONTROL", "Proxy continues running independently")
+                            break
+                        
+                        # Check for explicit shutdown opcode from MCC
+                        if data[0] == 99:
+                            self.log("CONTROL", "Shutdown notification from MCC - MCC is shutting down")
+                            self.log("CONTROL", "Proxy continues running independently")
+                            break
+                    except socket.timeout:
+                        continue
+                    except Exception as e:
+                        self.log("CONTROL", f"Connection lost: {e}")
                         break
-                    
-                    # Check for explicit shutdown opcode
-                    if data[0] == 99:
-                        self.log("CONTROL", "Shutdown signal received from MCC")
-                        self.shutdown_all()
-                        break
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    self.log("CONTROL", f"Connection lost: {e}")
-                    self.shutdown_all()
-                    break
-        
-        except ConnectionRefusedError:
-            self.log("CONTROL", "MCC not available for control connection")
-        except Exception as e:
-            self.log("CONTROL", f"Control connection error: {e}")
+                
+                # Connection lost, try to reconnect if proxy still running
+                if self.running:
+                    self.log("CONTROL", "Waiting before reconnection attempt...")
+                    time.sleep(3)
+            
+            except ConnectionRefusedError:
+                self.log("CONTROL", "MCC not available - will retry in 3 seconds")
+                if self.running:
+                    time.sleep(3)
+            except Exception as e:
+                self.log("CONTROL", f"Connection error: {e} - will retry")
+                if self.running:
+                    time.sleep(3)
     
     def shutdown_all(self):
         """

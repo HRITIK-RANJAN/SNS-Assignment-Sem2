@@ -488,6 +488,28 @@ class Drone:
             print(f"[{self.drone_id}] >> Executing: {command}")
     
     # ========================================================================
+    # Graceful Disconnect Signal
+    # ========================================================================
+    
+    def send_disconnect_signal(self):
+        """
+        Send OPCODE 95 (DISCONNECT) to MCC before closing socket.
+        This allows MCC to immediately clean up this drone's session,
+        rather than waiting for socket EOF detection.
+        """
+        if self.socket and self.authenticated:
+            try:
+                # OPCODE 95: DISCONNECT signal with drone ID
+                drone_id_bytes = self.drone_id.encode('utf-8') if isinstance(self.drone_id, str) else self.drone_id
+                msg = struct.pack('B', 95)  # OPCODE 95
+                msg += struct.pack('>I', len(drone_id_bytes))
+                msg += drone_id_bytes
+                self.socket.sendall(msg)
+                print(f"[{self.drone_id}] Sent disconnect signal to MCC")
+            except Exception as e:
+                print(f"[{self.drone_id}] Could not send disconnect signal: {e}")
+    
+    # ========================================================================
     # Main Connection Routine
     # ========================================================================
     
@@ -587,6 +609,8 @@ class Drone:
         
         finally:
             self.running = False
+            # Send graceful disconnect signal before closing socket
+            self.send_disconnect_signal()
             if self.socket:
                 try:
                     self.socket.close()
@@ -600,7 +624,7 @@ def main():
     parser = argparse.ArgumentParser(description="UAV Drone Client")
     parser.add_argument('--id', dest='drone_id', required=True, help='Drone ID')
     parser.add_argument('--mcc-host', default='localhost', help='MCC host address')
-    parser.add_argument('--mcc-port', type=int, default=8002, help='MCC port')
+    parser.add_argument('--mcc-port', type=int, default=8001, help='MCC port')
     
     args = parser.parse_args()
     

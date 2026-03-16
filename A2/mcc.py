@@ -40,6 +40,7 @@ class DroneSession:
         self.nonce_mcc = None             # RNMCC
         self.timestamp_drone = None       # TSi
         self.timestamp_mcc = None         # TSMCC
+        self.connection_alive = True      # Flag to track if connection is still active
         self.lock = threading.Lock()
 
 
@@ -476,27 +477,43 @@ class MissionControlCenter:
             
             # Phase 3: Keep connection alive for commands/broadcasts
             # The CLI thread handles sending via session.socket.sendall()
-            # This thread only monitors for disconnection
+            # This thread monitors for disconnection and handles disconnect signals
             while self.running and session.authenticated:
                 try:
                     # Use select to check for incoming data without blocking
+                    # Use 0.5s timeout for faster disconnection detection
                     import select
-                    readable, _, exceptional = select.select([client_socket], [], [client_socket], 2.0)
+                    readable, _, exceptional = select.select([client_socket], [], [client_socket], 0.5)
                     
                     if exceptional:
                         print(f"[MCC] Socket exception for {session.drone_id}")
+                        session.connection_alive = False
                         break
                     
                     if readable:
-                        # Check if connection is still alive
-                        data = client_socket.recv(1, socket.MSG_PEEK)
+                        # Read incoming data from drone
+                        data = client_socket.recv(1024)
                         if not data:
-                            print(f"[MCC] {session.drone_id} disconnected")
+                            print(f"[MCC] {session.drone_id} disconnected (EOF received)")
+                            session.connection_alive = False
+                            break
+                        
+                        # Check for OPCODE 95: Graceful disconnect signal
+                        opcode = data[0]
+                        if opcode == 95:
+                            print(f"[MCC] {session.drone_id} sent DISCONNECT signal")
+                            session.connection_alive = False
+                            # Immediately remove from active sessions
+                            with self.drones_lock:
+                                if session.drone_id in self.drones and self.drones[session.drone_id] is session:
+                                    del self.drones[session.drone_id]
+                                    print(f"[MCC] ✓ {session.drone_id} REMOVED from active sessions (graceful disconnect)")
                             break
                     
                 except socket.timeout:
                     continue
                 except Exception:
+                    session.connection_alive = False
                     break
             
         except Exception as e:
@@ -509,7 +526,10 @@ class MissionControlCenter:
                     # Only remove if this session object is the one currently registered
                     if session.drone_id in self.drones and self.drones[session.drone_id] is session:
                         del self.drones[session.drone_id]
-                        print(f"[MCC] Removed {session.drone_id} from active sessions")
+                        print(f"[MCC] ✓ {session.drone_id} REMOVED from active sessions (connection cleanup)")
+                    else:
+                        # Session was already removed (possibly by broadcast cleanup)
+                        print(f"{session.drone_id} already removed from active sessions")
             
             try:
                 client_socket.close()
@@ -669,33 +689,96 @@ class MissionControlCenter:
         Phase 3: Broadcast command to all authenticated drones.
         
         Steps:
-        1. Aggregate all session keys
-        2. Derive group key GK
-        3. Send GK to each drone (encrypted with their SK)
-        4. Send command encrypted with GK
+        1. Validate all active drone connections are still alive
+        2. Aggregate all session keys
+        3. Derive NEW group key GK (unique per broadcast)
+        4. Send GK to each drone (encrypted with their SK)
+        5. Send command encrypted with GK
         """
         with self.drones_lock:
             if not self.drones:
                 print("[MCC] No authenticated drones to broadcast to", flush=True)
                 return
             
-            auth_drones = [s for s in self.drones.values() if s.authenticated]
+            # Validate and clean up stale drone connections BEFORE broadcast
+            print("[MCC] Validating drone connection(s)...")
+            drones_to_remove = []
+            auth_drones = []
+            
+            for drone_id, session in list(self.drones.items()):
+                if not session.authenticated:
+                    continue
+                
+                # Actively probe the socket to detect disconnected drones
+                # The connection_alive flag may lag behind actual disconnection
+                # due to the background thread's select() loop timing
+                is_alive = session.connection_alive
+                if is_alive:
+                    try:
+                        # Non-blocking peek to check if socket is still connected
+                        session.socket.setblocking(False)
+                        try:
+                            peek_data = session.socket.recv(1, socket.MSG_PEEK)
+                            if not peek_data:
+                                # EOF received - drone has disconnected
+                                is_alive = False
+                                session.connection_alive = False
+                        except BlockingIOError:
+                            # No data available - socket is still alive (good)
+                            pass
+                        except (ConnectionResetError, BrokenPipeError, OSError):
+                            # Socket error - drone is disconnected
+                            is_alive = False
+                            session.connection_alive = False
+                        finally:
+                            session.socket.setblocking(True)
+                    except Exception:
+                        is_alive = False
+                        session.connection_alive = False
+                
+                if is_alive:
+                    auth_drones.append(session)
+                    print(f"[MCC] ✓ {session.drone_id} socket is ALIVE")
+                else:
+                    # Connection is dead
+                    print(f"[MCC] ✗ {session.drone_id} socket is DEAD")
+                    drones_to_remove.append(drone_id)
+            
+            # CRITICAL: Remove dead drones IMMEDIATELY from active sessions
+            # This happens BEFORE we do anything with broadcasts
+            for drone_id in drones_to_remove:
+                if drone_id in self.drones:
+                    del self.drones[drone_id]
+                    print(f"[MCC] ✓ {drone_id} IMMEDIATELY REMOVED from active sessions")
+            
             if not auth_drones:
-                print("[MCC] No authenticated drones", flush=True)
+                print("[MCC] No authenticated drones available for broadcast", flush=True)
                 return
             
             # Step 1: Collect all session keys
             session_keys = [s.session_key for s in auth_drones]
             
-            # Step 2: Derive group key
+            # Step 2: Derive NEW group key (includes timestamp for uniqueness per broadcast)
+            # GK = SHA256(SK1 || SK2 || ... || SKn || X_MCC || Timestamp)
+            broadcast_timestamp = int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF
             gk_material = b''.join(session_keys)
             gk_material += int_to_bytes(self.keypair.x, 256)
+            gk_material += struct.pack('>Q', broadcast_timestamp)
             group_key = hash_sha256(gk_material)
             
-            print(f"[MCC] Generated Group Key: {group_key.hex()[:32]}...")
+            print(f"[MCC] Generated NEW Group Key for broadcast: {group_key.hex()[:32]}...")
             
-            # Step 3: Distribute GK to each drone
+            # Step 3: Distribute GK to verified drones only (connection already validated)
+            print(f"[MCC] Distributing group key to {len(auth_drones)} verified drone(s)...")
+            drones_to_remove = []  # Track drones to remove if send fails
+            
             for session in auth_drones:
+                # Check connection status RIGHT BEFORE sending (not just at validation)
+                if not session.connection_alive:
+                    print(f"[MCC] ✗ {session.drone_id} disconnected before GK send - skipping")
+                    drones_to_remove.append(session)
+                    continue
+                
                 try:
                     iv, encrypted_gk = aes_encrypt(session.session_key, group_key)
                     
@@ -703,11 +786,29 @@ class MissionControlCenter:
                     msg = struct.pack('B', 70) + iv + encrypted_gk
                     session.socket.sendall(msg)
                     
-                    print(f"[MCC] Sent GK to {session.drone_id}")
+                    print(f"[MCC] ✓ Group key sent to {session.drone_id}")
+                except (BrokenPipeError, OSError, ConnectionResetError, socket.error) as e:
+                    print(f"[MCC] ✗ Failed to send GK to {session.drone_id}: {e}")
+                    # Mark for removal - drone is stale/disconnected
+                    drones_to_remove.append(session)
                 except Exception as e:
-                    print(f"[MCC] Failed to send GK to {session.drone_id}: {e}")
+                    print(f"[MCC] ✗ Unexpected error sending GK to {session.drone_id}: {e}")
             
-            # Step 4: Broadcast encrypted command
+            # Remove any drones that failed during GK distribution
+            for session in drones_to_remove:
+                if session.drone_id in self.drones and self.drones[session.drone_id] is session:
+                    del self.drones[session.drone_id]
+                    print(f"[MCC] ✗ {session.drone_id} REMOVED (failed during GK send)")
+            
+            # Filter out drones we couldn't reach
+            auth_drones = [s for s in auth_drones if s not in drones_to_remove]
+            
+            if not auth_drones:
+                print("[MCC] No drones available for command broadcast", flush=True)
+                return
+            
+            # Step 4: Broadcast encrypted command (with new group key)
+            print(f"[MCC] Broadcasting command: \"{command}\"")
             time.sleep(0.5)
             
             if isinstance(command, str):
@@ -718,12 +819,31 @@ class MissionControlCenter:
             
             msg = struct.pack('B', 80) + iv + encrypted_cmd + hmac_tag
             
+            drones_to_remove = []  # Reset for command sending
             for session in auth_drones:
+                # Check connection status RIGHT BEFORE sending (connection might have changed)
+                if not session.connection_alive:
+                    print(f"[MCC] ✗ {session.drone_id} disconnected before command send - skipping")
+                    drones_to_remove.append(session)
+                    continue
+                
                 try:
                     session.socket.sendall(msg)
-                    print(f"[MCC] Broadcast to {session.drone_id}")
+                    print(f"[MCC] ✓ Command broadcast to {session.drone_id}")
+                except (BrokenPipeError, OSError, ConnectionResetError, socket.error) as e:
+                    print(f"[MCC] ✗ Failed to broadcast to {session.drone_id}: {e}")
+                    # Mark for removal - drone is stale/disconnected
+                    drones_to_remove.append(session)
                 except Exception as e:
-                    print(f"[MCC] Failed to broadcast to {session.drone_id}: {e}")
+                    print(f"[MCC] ✗ Unexpected error broadcasting to {session.drone_id}: {e}")
+            
+            # Remove any drones that failed during command broadcast
+            for session in drones_to_remove:
+                if session.drone_id in self.drones and self.drones[session.drone_id] is session:
+                    del self.drones[session.drone_id]
+                    print(f"[MCC] ✗ {session.drone_id} REMOVED (failed during command send)")
+            
+            print(f"[MCC] Broadcast complete")
     
     # ========================================================================
     # CLI Commands
@@ -755,8 +875,8 @@ class MissionControlCenter:
         print("\n[MCC] Initiating shutdown...")
         print("[MCC] Sending shutdown signal to all connected drones...")
         
-        # Signal attack proxy to shutdown first
-        self._signal_attack_shutdown()
+        # Note: Attack proxy remains independent and continues running
+        
         time.sleep(0.3)
         
         # Send shutdown signal to all drones
@@ -805,7 +925,6 @@ class MissionControlCenter:
         print("Available Commands:")
         print("  list              - Show all authenticated drones")
         print("  broadcast <cmd>   - Send encrypted command to all drones")
-        print("  status            - Show server statistics")
         print("  shutdown          - Gracefully shutdown server")
         print("="*70)
         print("\nType your command below:")
@@ -839,17 +958,6 @@ class MissionControlCenter:
                 if cmd_lower == "list":
                     self.cmd_list_drones()
                 
-                elif cmd_lower == "status":
-                    with self.drones_lock:
-                        print(f"\n{'='*70}")
-                        print("SERVER STATUS")
-                        print(f"{'-'*70}")
-                        print(f"Server running: {self.running}")
-                        print(f"Connected drones: {len(self.drones)}")
-                        auth_count = sum(1 for s in self.drones.values() if s.authenticated)
-                        print(f"Authenticated: {auth_count}")
-                        print(f"{'='*70}\n", flush=True)
-                
                 elif cmd_lower.startswith("broadcast "):
                     cmd = user_input[10:]
                     print()  # Add blank line before output
@@ -864,7 +972,7 @@ class MissionControlCenter:
                     print("\n" + "="*70)
                     print("UNKNOWN COMMAND")
                     print("="*70)
-                    print("Use: list | broadcast <cmd> | status | shutdown | help")
+                    print("Use: list | broadcast <cmd> | shutdown")
                     print("="*70 + "\n", flush=True)
                 
             except KeyboardInterrupt:
