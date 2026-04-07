@@ -1,72 +1,97 @@
 # Multi-Source Intrusion Detection System (IDS)
 
-A lightweight, modular Intrusion Detection System (IDS) designed to combine information from multiple independent sensors (Network and Host) to improve detection accuracy and rigorously reduce false positives.
 
-## Key Features
+## Overview
 
-- **Multi-sensor Correlation**: Seamlessly correlates network flows and host application logs within a sliding time window.
-- **Rule-based & Statistical Anomaly Detection**: 
-  - Supports 6 deterministic rules: Fast/Slow Port Scans, Brute-force Logins, Suspicious Process Execution, Replay Attacks, and Multi-step Compromise.
-  - Includes a statistical Anomaly Detector utilizing Z-scores to identify abnormal request velocities.
-- **Robust Alert Manager**: Enforces strict severity escalation constraints (e.g., `Critical` alerts strictly require cross-source affirmation), deduplicates occurrences, and throttles alert floods using cooldown logic.
-- **Built-in Simulation Harness**: Includes a full attack suite to test all components natively without requiring external frameworks (like Snort or Suricata).
+A lightweight, modular IDS that correlates evidence from **network** and **host** sensors using rule-based and statistical detection. All components communicate through a unified JSON event schema and run as independent processes on a single machine.
 
-## System Architecture
+---
 
-The IDS is divided into discrete components running as independent processes, mimicking a distributed architecture:
-1. **Network Sensor (`src/network_sensor.py`)**: Captures and parses network flow metadata.
-2. **Host Sensor (`src/host_sensor.py`)**: Monitors simulated host-level logs (e.g., logins, process executions).
-3. **Correlation Engine (`src/correlation_engine.py`)**: Ingests multi-sensor events, applies sliding-window logic, and generates raw alerts.
-4. **Alert Manager (`src/alert_manager.py`)**: Deduplicates, scores, and manages finalized alerts.
-5. **Simulator (`src/simulator.py`)**: Generates testing traffic (benign and malicious).
-6. **Main Orchestrator (`src/main.py`)**: The single entry point that boots and coordinates all the above processes.
+## Architecture
+
+
+| Component            | File                   | Role |
+|----------------------|------------------------|------|
+| NetworkSensor        | `network_sensor.py`    | Normalises raw network flows → IDSEvent |
+| HostSensor           | `host_sensor.py`       | Normalises host logs → IDSEvent |
+| CorrelationEngine    | `correlation_engine.py`| Sliding-window rules + z-score anomaly detection |
+| AlertManager         | `alert_manager.py`     | Deduplication, cooldown, severity enforcement |
+| Simulator            | `simulator.py`         | Generates benign & attack traffic |
+| Schemas              | `schemas.py`           | Shared `IDSEvent` / `Alert` dataclasses |
+| Entry point          | `main.py`              | Process orchestration + metrics report |
+
+---
 
 ## Requirements
-- Python 3.8+
-- `psutil` (Optional, strictly used for CPU/Memory metric collection during evaluation)
+
+- Python 3.9+
+- `psutil` (optional, for CPU/RAM metrics)
+
+```bash
+pip install psutil
+```
 
 ---
 
-## Installation & Setup
+## Running
 
-1. Check your Python environment and install the required metrics library:
-   ```bash
-   pip install psutil
-   ```
-2. Navigate to the project root directory.
+```bash
+# Run all scenarios (default)
+python main.py
+
+# Run a single scenario
+python main.py --scenario brute_force
+python main.py --scenario fast_port_scan
+python main.py --scenario slow_port_scan
+python main.py --scenario noise
+python main.py --scenario sensor_fail
+python main.py --scenario multi_step
+```
+
+Alerts are written to `alerts.log` (one JSON object per line) and a colour-coded summary is printed to the terminal at the end of the run.
 
 ---
 
-## How to Run & Execution Sequence
+## Detection Rules
 
-You do **not** need to start the sensors, engines, or alert managers manually in sequence. The system is designed with a central orchestrator. 
+| # | Rule Name           | Trigger condition                                            | Default Severity |
+|---|---------------------|--------------------------------------------------------------|-----------------|
+| 1 | `FastPortScan`      | >20 distinct ports from one IP within <5 s                  | Medium          |
+| 2 | `SlowPortScan`      | >20 distinct ports from one IP over ≥5 s                    | Low             |
+| 3 | `BruteForce`        | >5 failed logins from one IP within 60 s                    | High            |
+| 4 | `SuspiciousProcess` | Known malicious process name executed (cmd.exe, nmap, …)    | Medium          |
+| 5 | `ReplayAttack`      | ≥15 identical events from one IP within 10 s                | Low             |
+| 6 | `MultiStepCompromise` | Brute force + successful login + suspicious process chain  | Critical        |
+| 7 | `TrafficAnomaly`    | z-score > 3.0 on per-IP request rate (anomaly detector)     | Medium          |
 
-**The only file you need to run is `src/main.py`.** 
 
-When executed, `main.py` automatically initializes the `multiprocessing` queues and starts the sensors, correlation engine, and alert manager in the correct operational sequence before invoking the attack simulator.
+### Anomaly detection (§7)
 
-### 1. Run the Full Test Suite
-To run all attack scenarios sequentially (including benign baselines):
-```bash
-cd src
-python3 main.py --scenario all
 ```
-*(Note: Please allow approximately 45 seconds for all scenarios and metrics to gracefully evaluate and terminate).*
-
-### 2. Target Specific Scenarios
-If you wish to test or debug individual attacks, you can specify them via the `--scenario` flag:
-```bash
-cd src
-python3 main.py --scenario brute_force
-python3 main.py --scenario fast_port_scan
-python3 main.py --scenario slow_port_scan
-python3 main.py --scenario noise
-python3 main.py --scenario sensor_fail
-python3 main.py --scenario multi_step
+z_f = (f_t − μ_f) / (σ_f + ε)    [alert when z_f > 3.0]
 ```
 
-### 3. Viewing the Results
-Once the orchestrator completes the tests and shuts down the subsystems gracefully, it will output:
-1. A summary of **Total Alerts Generated** categorized by Severity and Rule.
-2. **Performance Metrics** including Precision, Recall, F1-Score, and False Positives.
-3. Detailed event records will be appended to `src/alerts.log` in standard JSON format for your review.
+---
+
+## Metrics reported
+
+- **Precision / Recall / F1**
+- **False positive & false negative counts**
+- **Alert latency** (first / average / last, measured from run start)
+- **CPU & RAM** usage (sampled every 1 s via psutil)
+
+---
+
+## Output files
+
+| File         | Description                       |
+|--------------|-----------------------------------|
+| `alerts.log` | JSONL alert log (one alert / line)|
+
+---
+
+## Notes
+
+- All components share the same `IDSEvent` / `Alert` schema defined in `schemas.py`.
+- Critical alerts require evidence from ≥2 independent sensors (enforced in both `CorrelationEngine` and `AlertManager`).
+- Alert deduplication uses a 10-second cooldown keyed on `(rule, severity, src_ip)`.

@@ -222,14 +222,15 @@ def main():
                 except json.JSONDecodeError:
                     pass
 
-        print(f"\n{'=' * 55}")
+        print(f"\n{'-' * 85}")
         print(f"TOTAL ALERTS GENERATED: {len(alerts)}")
-        print(f"{'=' * 55}")
+        print(f"{'-' * 85}")
         for a in alerts:
-            print(f"  [{a['severity']:8s}] {a['rule_name']} — "
-                  f"{len(a['source_events'])} events  "
-                  f"sensors={a['sensors_involved']}")
-        print(f"{'=' * 55}\n")
+            sensors = ", ".join(a['sensors_involved']) if isinstance(a['sensors_involved'], list) else a['sensors_involved']
+            print(f"  [{a['severity']:<8}] {a['rule_name']:<25} | "
+                  f"Events: {len(a['source_events']):<5} | "
+                  f"Sensors: {sensors}")
+        print(f"{'-' * 85}\n")
 
         # ── Detection metrics ────────────────────────────────────────────
         # Ground truth: one unique attack rule per scenario that was run.
@@ -259,7 +260,7 @@ def main():
         f1        = (2 * precision * recall / (precision + recall)
                      if (precision + recall) > 0 else 0.0)
 
-        print("--- Detection metrics (approximated from scenarios) ---")
+        print("--- Detection Metrics (Approximated from Scenarios) ---")
         print(f"  Precision       : {precision:.2f}")
         print(f"  Recall          : {recall:.2f}")
         print(f"  F1-Score        : {f1:.2f}")
@@ -277,24 +278,24 @@ def main():
             # The CE evaluates every 1 s, so typical latency is 0–1 s.
             min_latency = min(alert_ts) - run_start
             max_latency = max(alert_ts) - run_start
-            print(f"\n--- Alert generation latency (measured) ---")
-            print(f"  First alert after run start : {min_latency:.2f}s")
-            print(f"  Last  alert after run start : {max_latency:.2f}s")
-            print(f"  (CE evaluation interval = 1.0 s; "
-                  f"worst-case per-event latency ≈ 1 s)")
+            print(f"\n--- Alert Generation Latency (Measured) ---")
+            print(f"  First alert after run start : {min_latency:.2f} s")
+            print(f"  Last  alert after run start : {max_latency:.2f} s")
+            print(f"  (CE evaluation interval = 1.0 s;")
+            print(f"   worst-case per-event latency = ~1.0 s)")
 
         # ── CPU / memory ─────────────────────────────────────────────────
         # FIX: print the actually-collected metrics instead of the placeholder
         # string "CPU/Memory profiles logged during execution."
-        print(f"\n--- CPU / memory usage (sampled every 1 s) ---")
+        print(f"\n--- CPU / Memory Usage (sampled every 1s) ---")
         if metrics_data:
             avg_cpu = sum(m['cpu_pct'] for m in metrics_data) / len(metrics_data)
             max_cpu = max(m['cpu_pct'] for m in metrics_data)
             avg_mem = sum(m['mem_mb']  for m in metrics_data) / len(metrics_data)
             max_mem = max(m['mem_mb']  for m in metrics_data)
-            print(f"  Samples collected : {len(metrics_data)}")
-            print(f"  CPU  avg / peak   : {avg_cpu:.1f}% / {max_cpu:.1f}%")
-            print(f"  RAM  avg / peak   : {avg_mem:.1f} MB / {max_mem:.1f} MB")
+            print(f"  Samples Collected : {len(metrics_data)}")
+            print(f"  CPU Avg / Peak    : {avg_cpu:5.1f}% / {max_cpu:5.1f}%")
+            print(f"  RAM Avg / Peak    : {avg_mem:7.1f} MB / {max_mem:7.1f} MB")
         elif not PSUTIL_AVAILABLE:
             print("  psutil not installed — install with: pip install psutil")
         else:
