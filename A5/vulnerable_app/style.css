@@ -1,0 +1,171 @@
+/* =========================================================
+   Lab 5 — Shared Stylesheet (vulnerable_app)
+   ========================================================= */
+
+*, *::before, *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    min-height: 100vh;
+    background: #0d0d0d;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    color: #e0e0e0;
+}
+
+.login-wrapper {
+    width: 100%;
+    max-width: 420px;
+    padding: 20px;
+}
+
+.login-box {
+    background: #1a1a2e;
+    border: 1px solid #e94560;
+    border-radius: 12px;
+    padding: 36px 40px;
+    box-shadow: 0 8px 32px rgba(233, 69, 96, 0.15);
+}
+
+.login-header {
+    text-align: center;
+    margin-bottom: 28px;
+}
+
+.login-header h1 {
+    font-size: 1.6rem;
+    color: #e94560;
+    margin-bottom: 6px;
+}
+
+.login-header p {
+    font-size: 0.85rem;
+    color: #888;
+}
+
+.form-group {
+    margin-bottom: 20px;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: 6px;
+    font-size: 0.9rem;
+    color: #aaa;
+}
+
+.form-group input {
+    width: 100%;
+    padding: 12px 14px;
+    background: #0d0d0d;
+    border: 1px solid #333;
+    border-radius: 6px;
+    color: #e0e0e0;
+    font-size: 0.95rem;
+    transition: border-color 0.2s;
+}
+
+.form-group input:focus {
+    outline: none;
+    border-color: #e94560;
+}
+
+.btn-login {
+    width: 100%;
+    padding: 13px;
+    background: #e94560;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s;
+    margin-top: 6px;
+}
+
+.btn-login:hover {
+    background: #c73652;
+}
+
+.btn-logout {
+    display: inline-block;
+    margin-top: 20px;
+    padding: 10px 20px;
+    background: #333;
+    color: #e0e0e0;
+    text-decoration: none;
+    border-radius: 6px;
+    font-size: 0.9rem;
+    transition: background 0.2s;
+}
+
+.btn-logout:hover {
+    background: #555;
+}
+
+.alert {
+    padding: 12px 14px;
+    border-radius: 6px;
+    margin-bottom: 20px;
+    font-size: 0.9rem;
+    line-height: 1.5;
+}
+
+.alert-error {
+    background: rgba(233, 69, 96, 0.15);
+    border: 1px solid #e94560;
+    color: #e94560;
+}
+
+.alert-success {
+    background: rgba(0, 200, 100, 0.12);
+    border: 1px solid #00c864;
+    color: #00c864;
+}
+
+.alert-info {
+    background: rgba(50, 150, 255, 0.12);
+    border: 1px solid #3296ff;
+    color: #3296ff;
+}
+
+.hint-box {
+    margin-top: 24px;
+    padding: 12px;
+    background: rgba(255,255,255,0.04);
+    border-radius: 6px;
+    font-size: 0.82rem;
+    color: #666;
+    line-height: 1.8;
+    text-align: center;
+}
+
+/* Result table shown after login / injection */
+.result-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 10px;
+    font-size: 0.85rem;
+}
+
+.result-table th,
+.result-table td {
+    border: 1px solid #333;
+    padding: 8px 12px;
+    text-align: left;
+}
+
+.result-table th {
+    background: #e94560;
+    color: #fff;
+}
+
+.result-table tr:nth-child(even) {
+    background: rgba(255,255,255,0.04);
+}
