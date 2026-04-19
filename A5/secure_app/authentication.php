@@ -73,40 +73,200 @@ $_SESSION['username']  = $user['username'];
     <meta charset="UTF-8">
     <title>Login Successful | Secure App</title>
     <style>
-        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        :root {
+            --primary: #10b981;
+            --primary-dark: #059669;
+            --primary-light: #34d399;
+            
+            --bg-primary: #0a0e27;
+            --bg-secondary: #1a1f3a;
+            --bg-tertiary: #232d4b;
+            
+            --text-primary: #e0e8ff;
+            --text-secondary: #a8b2d1;
+            --text-muted: #6b7896;
+            
+            --border-light: #3a4a6b;
+        }
+
+        *, *::before, *::after {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        html {
+            scroll-behavior: smooth;
+        }
+
         body {
-            min-height: 100vh; background: #0d1117;
-            display: flex; align-items: center; justify-content: center;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; color: #e6edf3;
+            min-height: 100vh;
+            background: linear-gradient(135deg, var(--bg-primary) 0%, #0d1228 50%, var(--bg-secondary) 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', sans-serif;
+            color: var(--text-primary);
+            padding: 20px;
         }
+
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: radial-gradient(circle at 20% 50%, rgba(16, 185, 129, 0.03) 0%, transparent 50%),
+                        radial-gradient(circle at 80% 80%, rgba(50, 150, 255, 0.03) 0%, transparent 50%);
+            pointer-events: none;
+            z-index: -1;
+        }
+
         .box {
-            background: #161b22; border: 1px solid #30a14e;
-            border-radius: 12px; padding: 40px 50px; text-align: center;
-            max-width: 420px; width: 100%;
-            box-shadow: 0 8px 32px rgba(48,161,78,0.15);
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-light);
+            border-radius: 16px;
+            padding: 48px 44px;
+            text-align: center;
+            max-width: 460px;
+            width: 100%;
+            box-shadow: 
+                0 20px 60px rgba(16, 185, 129, 0.1),
+                0 0 40px rgba(50, 150, 255, 0.05),
+                inset 0 1px 0 rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            animation: slideInUp 0.5s ease-out;
+            position: relative;
+            overflow: hidden;
         }
-        h1 { color: #30a14e; font-size: 2rem; margin-bottom: 10px; }
-        p { color: #8b949e; margin-bottom: 24px; }
-        strong { color: #e6edf3; }
+
+        @keyframes slideInUp {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .box::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: linear-gradient(90deg, transparent, var(--primary), transparent);
+            opacity: 0.5;
+        }
+
+        h1 {
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-light) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            font-size: 2rem;
+            font-weight: 700;
+            margin-bottom: 12px;
+            letter-spacing: -0.5px;
+        }
+
+        p {
+            color: var(--text-secondary);
+            margin-bottom: 28px;
+            font-size: 1rem;
+            line-height: 1.6;
+        }
+
+        strong {
+            color: var(--text-primary);
+            font-weight: 700;
+        }
+
         a {
-            display: inline-block; padding: 10px 24px;
-            background: #21262d; color: #e6edf3; text-decoration: none;
-            border-radius: 6px; font-size: 0.9rem; border: 1px solid #30363d;
+            display: inline-block;
+            padding: 14px 32px;
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+            color: #fff;
+            text-decoration: none;
+            border-radius: 8px;
+            font-size: 0.95rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3);
+            position: relative;
+            overflow: hidden;
+            border: none;
+            cursor: pointer;
         }
-        a:hover { background: #30363d; }
+
+        a::before {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 0;
+            height: 0;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.2);
+            transform: translate(-50%, -50%);
+            transition: width 0.6s, height 0.6s;
+        }
+
+        a:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(16, 185, 129, 0.4);
+        }
+
+        a:active {
+            transform: translateY(0);
+        }
+
+        a:hover::before {
+            width: 300px;
+            height: 300px;
+        }
+
         .note {
-            margin-top: 20px; padding: 10px; background: rgba(48,161,78,0.08);
-            border-radius: 6px; font-size: 0.8rem; color: #30a14e;
+            margin-top: 28px;
+            padding: 16px 18px;
+            background: linear-gradient(135deg, var(--bg-tertiary) 0%, var(--bg-primary) 100%);
+            border: 1px solid var(--border-light);
+            border-radius: 8px;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            line-height: 1.6;
+        }
+
+        @media (max-width: 600px) {
+            .box {
+                padding: 36px 28px;
+                border-radius: 12px;
+            }
+
+            h1 {
+                font-size: 1.5rem;
+            }
+
+            p {
+                font-size: 0.95rem;
+            }
         }
     </style>
 </head>
 <body>
 <div class="box">
-    <h1>&#x2705; Welcome!</h1>
+    <h1 style="font-size: 1.8rem; font-weight: 700; margin-bottom: 24px; text-align: center; background: linear-gradient(135deg, #10b981 0%, #34d399 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;">Secure App</h1>
+    <h2 style="font-size: 1.4rem; font-weight: 700; margin-bottom: 16px; text-align: center;">Welcome</h2>
     <p>Logged in as <strong><?= htmlspecialchars($_SESSION['username']) ?></strong></p>
     <a href="index.php?logout=1">Logout</a>
     <div class="note">
-        &#x1F512; This page does not display raw query output,<br>
+         This page does not display raw query output,<br>
         database contents, or error messages.
     </div>
 </div>

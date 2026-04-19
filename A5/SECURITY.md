@@ -1,5 +1,5 @@
 # SECURITY.md — SQL Injection: Attack and Defense Analysis
-**Lab 5 | System and Network Security (CS5.470) | IIIT Hyderabad**
+**Lab 5 | System and Network Security (CS5.470) **
 
 ---
 

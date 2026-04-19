@@ -7,7 +7,7 @@
 
 $host   = "localhost";
 $dbname = "lab5_secure";    // Separate DB with hashed passwords
-$dbuser = "root";
+$dbuser = "lab5_user";
 $dbpass = "";
 
 try {

@@ -1,7 +1,5 @@
 # Lab 5 — SQL Injection Attack and Defense
 **Course:** System and Network Security (CS5.470)  
-**Institute:** IIIT Hyderabad  
-**Deadline:** 17-04-2026, 11:59 PM  
 
 ---
 
@@ -36,13 +34,12 @@ lab5_submission/
 | XAMPP     | 8.x        |
 | PHP       | 8.x        |
 | MySQL     | 8.x        |
-| Browser   | Any modern |
 
 ---
 
 ## Setup Instructions
 
-### Step 1 — Install XAMPP
+### Step 1 — Prerequisites
 1. Download and install [XAMPP](https://www.apachefriends.org/).
 2. Open the XAMPP Control Panel.
 3. Start **Apache** and **MySQL**.
@@ -158,13 +155,6 @@ Password: anything
 ```
 Login fails → condition is false → inference confirmed.
 
-**Enumerating password length:**
-```
-Username: admin' AND LENGTH(password)=8 --
-Password: anything
-```
-If login succeeds, admin's password is 8 characters.
-
 ---
 
 ### Attack 4 — Database Modification (MANDATORY)
@@ -187,7 +177,7 @@ Password: anything
 **After:** admin password = pwned  
 Verify by logging in as `admin / pwned`.
 
-> ⚠️ Screenshots of Before and After states are in the `Screenshots/` folder.
+> Note : Screenshots of Before and After states are in the `Screenshots/` folder. The screenshot is taken side by side for both Secure app and Vulnerable app
 
 ---
 

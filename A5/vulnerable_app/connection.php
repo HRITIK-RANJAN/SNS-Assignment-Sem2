@@ -1,7 +1,7 @@
 <?php
 // Database connection for vulnerable application
 $host     = "localhost";
-$dbuser   = "root";
+$dbuser   = "lab5_user";
 $dbpass   = "";         // Default XAMPP password is empty
 $dbname   = "lab5";
 
