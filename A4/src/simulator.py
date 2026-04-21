@@ -88,7 +88,7 @@ class Simulator:
                 'dst_port': port,
                 'protocol': 'TCP'
             })
-            time.sleep(0.3)
+            time.sleep(0.5)
 
     def scenario_noise_injection(self):
         """Injecting identical noise events to trigger the replay attack rule"""

@@ -27,10 +27,17 @@ EVENT_WEIGHTS: Dict[str, float] = {
 # Minimum aggregate weight required to trigger each rule.
 SCORE_THRESHOLDS: Dict[str, float] = {
     'BruteForce':         6.0,   # ≥6 failed logins × 1.0
+    'CrossSourceBruteForce': 9.0,  # combined host+network evidence
     'FastPortScan':       8.0,   # ≥16 port probes × 0.5 (>20 ports)
     'SlowPortScan':       8.0,
     'ReplayAttack':       4.5,   # ≥15 duplicates × 0.3
     'MultiStepCompromise': 5.0,  # sum of cross-sensor combined evidence
+}
+
+# Keep this list intentionally tight to avoid broad false positives.
+SUSPICIOUS_PROCESS_NAMES = {
+    'nc', 'netcat', 'nmap', 'mimikatz', 'psexec',
+    'powershell.exe', 'cmd.exe'
 }
 
 
@@ -51,6 +58,16 @@ def _weight(event: IDSEvent) -> float:
 def _score(events: List[IDSEvent]) -> float:
     """Aggregate evidence score: score(u,t) = Σ w(e)."""
     return sum(_weight(e) for e in events)
+
+
+def _event_signature(event: IDSEvent) -> str:
+    """Stable event signature used for replay/noise detection."""
+    details = json.dumps(event.details or {}, sort_keys=True)
+    return (
+        f"{event.sensor}:{event.event_type}:{event.src_ip}:{event.dst_ip}:"
+        f"{event.src_port}:{event.dst_port}:{event.protocol}:{event.user}:"
+        f"{event.action}:{event.process_name}:{event.packet_count}:{event.byte_count}:{details}"
+    )
 
 
 class CorrelationEngine:
@@ -189,12 +206,13 @@ class CorrelationEngine:
             description=description,
             source_events=[e.event_id for e in events],
             rule_name=rule_name,
-            sensors_involved=sensors
+            sensors_involved=sensors,
+            src_ip=src_ip or None,
         )
         self.alert_queue.put(alert.to_json())
 
     # ------------------------------------------------------------------
-    # Rule evaluation  (§4: ≥6 non-trivial deterministic rules)
+    # Rule evaluation  (4: ≥6 non-trivial deterministic rules)
     # ------------------------------------------------------------------
 
     def _evaluate_rules(self):
@@ -217,17 +235,11 @@ class CorrelationEngine:
                 elif e.event_type == 'login' and e.action == 'success' and e.src_ip:
                     ip_success_logins[e.src_ip].append(e)
                 elif e.event_type == 'process':
-                    if e.process_name in {
-                        '/bin/bash', '/bin/sh', 'cmd.exe',
-                        'powershell.exe', 'nc', 'netcat', 'nmap'
-                    }:
+                    if e.process_name in SUSPICIOUS_PROCESS_NAMES:
                         suspicious_procs.append(e)
 
             # Hash for replay detection (excludes volatile fields).
-            ehash = (
-                f"{e.sensor}:{e.event_type}:{e.src_ip}:{e.dst_ip}:"
-                f"{e.src_port}:{e.dst_port}:{e.user}:{e.action}:{e.process_name}"
-            )
+            ehash = _event_signature(e)
             event_hashes[ehash].append(e)
 
         # ── Rules 1 & 2: Port scans ──────────────────────────────────────
@@ -254,7 +266,33 @@ class CorrelationEngine:
                         "Low", events, src_ip=ip
                     )
 
-        # ── Rule 3: Brute-force login ────────────────────────────────────
+        # ── Rule 3: Cross-source brute-force confirmation ────────────────
+        # Assignment clause: Critical when at least two independent sources
+        # agree within the correlation window.
+        for ip, failures in ip_failed_logins.items():
+            if len(failures) <= 5:
+                continue
+            ssh_attempts = [e for e in ip_network_events.get(ip, []) if e.dst_port == 22]
+            if len(ssh_attempts) <= 5:
+                continue
+
+            combined = failures + ssh_attempts
+            first_ts = min(e.timestamp for e in combined)
+            last_ts = max(e.timestamp for e in combined)
+            if (last_ts - first_ts) >= self.window_size:
+                continue
+
+            score = _score(combined)
+            if score >= SCORE_THRESHOLDS['CrossSourceBruteForce']:
+                self._trigger_alert(
+                    "CrossSourceBruteForce",
+                    f"Cross-source agreement for brute force from {ip}: "
+                    f"{len(failures)} failed logins + {len(ssh_attempts)} "
+                    f"SSH attempts within window (score={score:.1f})",
+                    "Critical", combined, src_ip=ip
+                )
+
+        # ── Rule 4: Brute-force login ────────────────────────────────────
         for ip, failures in ip_failed_logins.items():
             if len(failures) <= 5:
                 continue
@@ -270,7 +308,7 @@ class CorrelationEngine:
                     "High", failures, src_ip=ip
                 )
 
-        # ── Rule 4: Suspicious process ───────────────────────────────────
+        # ── Rule 5: Suspicious process ───────────────────────────────────
         for proc in suspicious_procs:
             self._trigger_alert(
                 "SuspiciousProcess",
@@ -279,14 +317,15 @@ class CorrelationEngine:
                 src_ip=proc.src_ip or ''
             )
 
-        # ── Rule 5: Replay / noise injection ────────────────────────────
+        # ── Rule 6: Replay / noise injection ────────────────────────────
         for h, evts in event_hashes.items():
             if len(evts) <= 15:
                 continue
             time_diff = evts[-1].timestamp - evts[0].timestamp
             if time_diff >= 10.0:
                 continue
-            score = _score(evts)
+            # Replay/noise evidence uses dedicated replay weight.
+            score = len(evts) * EVENT_WEIGHTS['network_replay']
             if score >= SCORE_THRESHOLDS['ReplayAttack']:
                 src_ip = evts[0].src_ip or ''
                 self._trigger_alert(
@@ -297,7 +336,7 @@ class CorrelationEngine:
                     "Low", evts, src_ip=src_ip
                 )
 
-        # ── Rule 6: Multi-step compromise ────────────────────────────────
+        # ── Rule 7: Multi-step compromise ────────────────────────────────
         for ip, failures in ip_failed_logins.items():
             if len(failures) <= 3:
                 continue
@@ -305,13 +344,20 @@ class CorrelationEngine:
             if not successes:
                 continue
             for succ in successes:
+                # Enforce sequence: login success must follow the failure burst.
+                if succ.timestamp <= failures[-1].timestamp:
+                    continue
                 for sp in suspicious_procs:
                     if sp.timestamp <= succ.timestamp:
                         continue
                     if sp.user != succ.user:
                         continue
+                    # Ensure the suspicious process belongs to the same source.
+                    if sp.src_ip and sp.src_ip != ip:
+                        continue
                     net_evts = ip_network_events.get(ip, [])
-                    combined = failures + [succ, sp] + net_evts[:1]
+                    net_context = [n for n in net_evts if n.timestamp <= succ.timestamp]
+                    combined = failures + [succ, sp] + net_context[:3]
                     score = _score(combined)
                     if score >= SCORE_THRESHOLDS['MultiStepCompromise']:
                         self._trigger_alert(
@@ -335,12 +381,17 @@ class CorrelationEngine:
                 bin_idx = int((now - t) / 5.0)
                 bins[bin_idx] += 1
 
-            rates = list(bins.values())
-            if len(rates) < 3:
+            # Build a deterministic baseline from fixed 5-second bins.
+            max_bin = int(self.window_size)
+            rates = [bins.get(i, 0) for i in range(max_bin + 1)]
+            if len(rates) < 4:
                 continue
 
-            current_rate  = bins[0]
+            current_rate  = rates[0]
             history_rates = rates[1:]
+            if sum(history_rates) < 10:
+                # Not enough historical volume for a stable baseline.
+                continue
 
             mu       = sum(history_rates) / len(history_rates)
             variance = sum((x - mu) ** 2 for x in history_rates) / len(history_rates)

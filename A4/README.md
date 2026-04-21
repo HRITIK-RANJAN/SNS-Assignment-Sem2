@@ -54,15 +54,38 @@ Alerts are written to `alerts.log` (one JSON object per line) and a colour-coded
 
 ## Detection Rules
 
-| # | Rule Name           | Trigger condition                                            | Default Severity |
-|---|---------------------|--------------------------------------------------------------|-----------------|
-| 1 | `FastPortScan`      | >20 distinct ports from one IP within <5 s                  | Medium          |
-| 2 | `SlowPortScan`      | >20 distinct ports from one IP over ≥5 s                    | Low             |
-| 3 | `BruteForce`        | >5 failed logins from one IP within 60 s                    | High            |
-| 4 | `SuspiciousProcess` | Known malicious process name executed (cmd.exe, nmap, …)    | Medium          |
-| 5 | `ReplayAttack`      | ≥15 identical events from one IP within 10 s                | Low             |
-| 6 | `MultiStepCompromise` | Brute force + successful login + suspicious process chain  | Critical        |
-| 7 | `TrafficAnomaly`    | z-score > 3.0 on per-IP request rate (anomaly detector)     | Medium          |
+| # | Rule Name                | Trigger condition                                                                    | Base Severity |
+|---|--------------------------|--------------------------------------------------------------------------------------|---------------|
+| 1 | `FastPortScan`           | >20 distinct ports from one IP within <5 s                                          | Medium        |
+| 2 | `SlowPortScan`           | >20 distinct ports from one IP over >=5 s                                           | Low           |
+| 3 | `CrossSourceBruteForce`  | >5 failed host logins + >5 network SSH attempts (port 22) for same IP in window    | Critical      |
+| 4 | `BruteForce`             | >5 failed logins from one IP within 60 s                                            | High          |
+| 5 | `SuspiciousProcess`      | Known suspicious process executed (cmd.exe, nmap, netcat, powershell.exe, ...)      | Medium        |
+| 6 | `ReplayAttack`           | >=15 identical events from one IP within 10 s                                       | Low           |
+| 7 | `MultiStepCompromise`    | Brute force + successful login + suspicious process chain                            | Critical      |
+| 8 | `TrafficAnomaly`         | z-score > 3.0 on per-IP request rate (anomaly detector)                             | Medium        |
+
+---
+
+## Severity Mapping (How It Works)
+
+Severity is mapped in three stages:
+
+1. **Rule-level base severity (CorrelationEngine)**
+	- Each detector emits a base severity as shown in the rule table above.
+
+2. **Engine-level remapping (`_trigger_alert`)**
+	- **Downgrade guard**: if an alert is `Critical` but only one sensor contributed, severity is downgraded to `High`.
+	- **Cross-source elevation**: if the same `(rule_name, src_ip)` is observed from a second independent sensor within the active window, the alert is elevated to `Critical`.
+
+3. **AlertManager defence-in-depth remapping**
+	- A second independent guard again downgrades any single-sensor `Critical` to `High` before final logging.
+
+Important behavior:
+
+- Threshold scores decide **whether** a rule fires.
+- The rule and remapping logic decide the final severity that appears in `alerts.log`.
+- Allowed severities are strictly validated as: `Info`, `Low`, `Medium`, `High`, `Critical`.
 
 
 ### Anomaly detection (§7)
@@ -77,7 +100,7 @@ z_f = (f_t − μ_f) / (σ_f + ε)    [alert when z_f > 3.0]
 
 - **Precision / Recall / F1**
 - **False positive & false negative counts**
-- **Alert latency** (first / average / last, measured from run start)
+- **Alert latency** (first / last, measured from run start)
 - **CPU & RAM** usage (sampled every 1 s via psutil)
 
 ---

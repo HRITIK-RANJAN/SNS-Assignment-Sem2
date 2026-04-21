@@ -26,9 +26,11 @@ def _extract_ip(description: str) -> str:
 
 class AlertManager:
     def __init__(self, alert_queue: multiprocessing.Queue,
-                 cooldown_seconds: float = 10.0):
+                 cooldown_seconds: float = 10.0,
+                 max_alert_history: int = 5000):
         self.alert_queue = alert_queue
         self.cooldown_seconds = cooldown_seconds
+        self.max_alert_history = max_alert_history
         self.running = False
 
         # FIX: key is now (rule_name, severity, src_ip) so that alerts for
@@ -63,12 +65,18 @@ class AlertManager:
         return self.generated_alerts
 
     def _process_alert(self, alert: Alert) -> bool:
-        # FIX: include the source IP in the dedup signature so that concurrent
-        # attacks from different IPs are never suppressed by each other.
-        src_ip = _extract_ip(alert.description)
+        # Prefer structured src_ip from alert payload; fall back to description
+        # parsing only for backward compatibility with old alert formats.
+        src_ip = alert.src_ip or _extract_ip(alert.description)
         signature = f"{alert.rule_name}_{alert.severity}_{src_ip}"
 
         now = time.time()
+
+        # Prune stale dedup keys to avoid unbounded memory growth.
+        dedup_ttl = self.cooldown_seconds * 6
+        stale_keys = [k for k, ts in self.last_alerts.items() if now - ts > dedup_ttl]
+        for k in stale_keys:
+            del self.last_alerts[k]
 
         if signature in self.last_alerts:
             elapsed = now - self.last_alerts[signature]
@@ -94,6 +102,8 @@ class AlertManager:
             )
 
         self.generated_alerts.append(alert)
+        if len(self.generated_alerts) > self.max_alert_history:
+            self.generated_alerts = self.generated_alerts[-self.max_alert_history:]
         logger.warning(
             f"ALERT [{alert.severity}] Rule:{alert.rule_name} | "
             f"Events:{len(alert.source_events)} | "

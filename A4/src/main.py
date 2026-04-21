@@ -3,6 +3,7 @@ import json
 import logging
 import multiprocessing
 import os
+import re
 import threading
 import time
 
@@ -18,9 +19,18 @@ from correlation_engine import CorrelationEngine
 from alert_manager import AlertManager
 from simulator import Simulator
 
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger("Main")
+
+_IP_RE = re.compile(r'\b(\d{1,3}(?:\.\d{1,3}){3})\b')
+
+
+def _extract_ip(description: str) -> str:
+    match = _IP_RE.search(description or '')
+    return match.group(1) if match else ''
 
 
 # ---------------------------------------------------------------------------
@@ -41,51 +51,52 @@ def run_correlation_engine(in_q, out_q):
 
 # ---------------------------------------------------------------------------
 # Metrics collection
-# FIX: collect_metrics() was defined but never called.  It is now launched on
-# a background daemon thread immediately after the worker processes start, and
-# its results are returned via a shared list so main() can print them.
 # ---------------------------------------------------------------------------
 
-def collect_metrics(pid_list: list, stop_event: threading.Event,
-                    results: list) -> None:
+def collect_metrics(pid_list: list, stop_event: threading.Event, results: list) -> None:
     """
     Sample CPU (%) and RSS memory (MB) for every PID in pid_list once per
-    second until stop_event is set.  Appends one dict per sample to results.
+    second until stop_event is set. Appends one dict per sample to results.
     """
     if not PSUTIL_AVAILABLE:
-        logger.warning("psutil not available — CPU/memory metrics skipped.")
+        logger.warning("psutil not available - CPU/memory metrics skipped.")
         return
+
+    processes = {}
+    for pid in pid_list:
+        try:
+            proc = psutil.Process(pid)
+            # Prime the moving counter; following reads become meaningful.
+            proc.cpu_percent(interval=None)
+            processes[pid] = proc
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
 
     while not stop_event.is_set():
         total_cpu = 0.0
         total_mem = 0.0
-        for pid in pid_list:
+        for pid, proc in list(processes.items()):
             try:
-                p = psutil.Process(pid)
-                total_cpu += p.cpu_percent(interval=0)
-                total_mem += p.memory_info().rss
+                total_cpu += proc.cpu_percent(interval=None)
+                total_mem += proc.memory_info().rss
             except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
+                del processes[pid]
+
         results.append({
             'time': time.time(),
             'cpu_pct': round(total_cpu, 2),
-            'mem_mb':  round(total_mem / (1024 * 1024), 2),
+            'mem_mb': round(total_mem / (1024 * 1024), 2),
         })
         time.sleep(1)
 
 
 # ---------------------------------------------------------------------------
-# Alert-manager process (writes to file; latency-stamped)
+# Alert-manager process (writes to file)
 # ---------------------------------------------------------------------------
 
 def run_am(in_q, log_path: str) -> None:
     """
-    Subclass of AlertManager that:
-    • appends every new alert as a JSON line to log_path
-    • computes alert latency from the earliest source_event timestamp stored
-      inside the IDSEvent records (we use alert.timestamp which the CE stamps
-      at generation time; the simulator stamps raw events with time.time() so
-      the difference is the true engine latency).
+    Subclass of AlertManager that appends each accepted alert to log_path.
     """
     from schemas import Alert as _Alert
 
@@ -106,28 +117,28 @@ def run_am(in_q, log_path: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-Source IDS")
-    parser.add_argument('--scenario', type=str, default='all',
-                        help='Scenario to run (all | brute_force | fast_port_scan | '
-                             'slow_port_scan | noise | sensor_fail | multi_step)')
+    parser.add_argument(
+        '--scenario',
+        type=str,
+        default='all',
+        help=('Scenario to run (all | brute_force | fast_port_scan | '
+              'slow_port_scan | noise | sensor_fail | multi_step)')
+    )
     args = parser.parse_args()
 
-    net_in_q  = multiprocessing.Queue()
+    net_in_q = multiprocessing.Queue()
     host_in_q = multiprocessing.Queue()
-    event_q   = multiprocessing.Queue()
-    alert_q   = multiprocessing.Queue()
+    event_q = multiprocessing.Queue()
+    alert_q = multiprocessing.Queue()
 
-    net_proc  = multiprocessing.Process(target=run_network_sensor,
-                                        args=(net_in_q, event_q))
-    host_proc = multiprocessing.Process(target=run_host_sensor,
-                                        args=(host_in_q, event_q))
-    corr_proc = multiprocessing.Process(target=run_correlation_engine,
-                                        args=(event_q, alert_q))
+    net_proc = multiprocessing.Process(target=run_network_sensor, args=(net_in_q, event_q))
+    host_proc = multiprocessing.Process(target=run_host_sensor, args=(host_in_q, event_q))
+    corr_proc = multiprocessing.Process(target=run_correlation_engine, args=(event_q, alert_q))
 
     log_path = 'alerts.log'
     os.system(f'rm -f {log_path}')
 
-    am_proc = multiprocessing.Process(target=run_am,
-                                      args=(alert_q, log_path))
+    am_proc = multiprocessing.Process(target=run_am, args=(alert_q, log_path))
 
     net_proc.start()
     host_proc.start()
@@ -139,10 +150,8 @@ def main():
         f"Corr({corr_proc.pid}), AM({am_proc.pid})"
     )
 
-    # FIX: start metrics collection on a background thread immediately after
-    # all worker processes have been launched.
-    pid_list      = [net_proc.pid, host_proc.pid, corr_proc.pid, am_proc.pid]
-    metrics_stop  = threading.Event()
+    pid_list = [net_proc.pid, host_proc.pid, corr_proc.pid, am_proc.pid]
+    metrics_stop = threading.Event()
     metrics_data: list = []
     metrics_thread = threading.Thread(
         target=collect_metrics,
@@ -153,12 +162,9 @@ def main():
     logger.info("Metrics collection thread started.")
 
     sim = Simulator(net_in_q, host_in_q)
-
-    # Record wall-clock start so we can compute per-scenario latencies.
     run_start = time.time()
 
-    time.sleep(1)                          # let queues stabilise
-
+    time.sleep(1)
     sim.generate_benign(duration=2)
 
     if args.scenario in ('brute_force', 'all'):
@@ -189,11 +195,9 @@ def main():
 
     logger.info("Test finished. Shutting down...")
 
-    # Stop metrics collection before joining processes.
     metrics_stop.set()
     metrics_thread.join(timeout=3)
 
-    # Poison pills
     net_in_q.put(None)
     host_in_q.put(None)
     event_q.put(None)
@@ -204,13 +208,9 @@ def main():
     corr_proc.join(timeout=3)
     am_proc.join(timeout=3)
 
-    for p in (net_proc, host_proc, corr_proc, am_proc):
-        if p.is_alive():
-            p.terminate()
-
-    # -----------------------------------------------------------------------
-    # Report
-    # -----------------------------------------------------------------------
+    for proc in (net_proc, host_proc, corr_proc, am_proc):
+        if proc.is_alive():
+            proc.terminate()
 
     logger.info("Shut down complete. Printing report:")
     try:
@@ -220,84 +220,96 @@ def main():
                 try:
                     alerts.append(json.loads(line.strip()))
                 except json.JSONDecodeError:
-                    pass
+                    continue
 
         print(f"\n{'-' * 85}")
         print(f"TOTAL ALERTS GENERATED: {len(alerts)}")
         print(f"{'-' * 85}")
-        for a in alerts:
-            sensors = ", ".join(a['sensors_involved']) if isinstance(a['sensors_involved'], list) else a['sensors_involved']
-            print(f"  [{a['severity']:<8}] {a['rule_name']:<25} | "
-                  f"Events: {len(a['source_events']):<5} | "
-                  f"Sensors: {sensors}")
+        for alert in alerts:
+            sensors = ", ".join(alert['sensors_involved']) if isinstance(alert['sensors_involved'], list) else alert['sensors_involved']
+            print(
+                f"  [{alert['severity']:<8}] {alert['rule_name']:<25} | "
+                f"Events: {len(alert['source_events']):<5} | "
+                f"Sensors: {sensors} | "
+                f"SrcIP: {alert.get('src_ip') or _extract_ip(alert.get('description', '')) or '-'}"
+            )
         print(f"{'-' * 85}\n")
 
-        # ── Detection metrics ────────────────────────────────────────────
-        # Ground truth: one unique attack rule per scenario that was run.
-        scenario_rules = {
-            'brute_force':    'BruteForce',
-            'fast_port_scan': 'FastPortScan',
-            'slow_port_scan': 'SlowPortScan',
-            'noise':          'ReplayAttack',
-            'sensor_fail':    'BruteForce',   # same rule, different IP
-            'multi_step':     'MultiStepCompromise',
+        # Incident-level ground truth uses (rule_name, src_ip).
+        scenario_truth = {
+            'brute_force': [
+                ('BruteForce', '192.168.1.100'),
+                ('CrossSourceBruteForce', '192.168.1.100'),
+            ],
+            'fast_port_scan': [('FastPortScan', '192.168.1.101')],
+            'slow_port_scan': [('SlowPortScan', '192.168.1.102')],
+            'noise': [('ReplayAttack', '192.168.1.103')],
+            'sensor_fail': [('BruteForce', '192.168.1.104')],
+            'multi_step': [('MultiStepCompromise', '192.168.1.105')],
         }
+
         if args.scenario == 'all':
-            expected_rules = set(scenario_rules.values())
+            expected_incidents = {
+                incident
+                for incidents in scenario_truth.values()
+                for incident in incidents
+            }
         else:
-            expected_rules = {scenario_rules[args.scenario]} if args.scenario in scenario_rules else set()
+            expected_incidents = set(scenario_truth.get(args.scenario, []))
 
-        detected_rules  = {a['rule_name'] for a in alerts
-                           if a['rule_name'] != 'TrafficAnomaly'}
-        true_positives  = len(detected_rules & expected_rules)
-        false_positives = len([a for a in alerts if a['rule_name'] == 'TrafficAnomaly'])
-        false_negatives = len(expected_rules - detected_rules)
+        detected_incidents = set()
+        for alert in alerts:
+            ip = alert.get('src_ip') or _extract_ip(alert.get('description', ''))
+            rule = alert.get('rule_name', '')
+            if rule and ip:
+                detected_incidents.add((rule, ip))
 
-        precision = (true_positives / (true_positives + false_positives)
-                     if (true_positives + false_positives) > 0 else 0.0)
-        recall    = (true_positives / (true_positives + false_negatives)
-                     if (true_positives + false_negatives) > 0 else 0.0)
-        f1        = (2 * precision * recall / (precision + recall)
-                     if (precision + recall) > 0 else 0.0)
+        true_positives = len(detected_incidents & expected_incidents)
+        false_positives = len(detected_incidents - expected_incidents)
+        false_negatives = len(expected_incidents - detected_incidents)
 
-        print("--- Detection Metrics (Approximated from Scenarios) ---")
+        precision = (
+            true_positives / (true_positives + false_positives)
+            if (true_positives + false_positives) > 0 else 0.0
+        )
+        recall = (
+            true_positives / (true_positives + false_negatives)
+            if (true_positives + false_negatives) > 0 else 0.0
+        )
+        f1 = (
+            2 * precision * recall / (precision + recall)
+            if (precision + recall) > 0 else 0.0
+        )
+
+        print("--- Detection Metrics (Incident-Level) ---")
         print(f"  Precision       : {precision:.2f}")
         print(f"  Recall          : {recall:.2f}")
         print(f"  F1-Score        : {f1:.2f}")
+        print(f"  True Positives  : {true_positives}")
         print(f"  False Positives : {false_positives}")
         print(f"  False Negatives : {false_negatives}")
 
-        # ── Latency ──────────────────────────────────────────────────────
-        # Each Alert carries a timestamp set by the CorrelationEngine at the
-        # moment it fires.  The run_start wall-clock gives a lower bound; the
-        # difference between the earliest alert timestamp and the scenario
-        # start is a rough but real latency figure (no synthetic estimate).
-        # FIX: report measured latency instead of a hardcoded "< 100ms".
         if alerts:
-            alert_ts   = [a['timestamp'] for a in alerts]
-            # The CE evaluates every 1 s, so typical latency is 0–1 s.
+            alert_ts = [a['timestamp'] for a in alerts]
             min_latency = min(alert_ts) - run_start
             max_latency = max(alert_ts) - run_start
-            print(f"\n--- Alert Generation Latency (Measured) ---")
+            print("\n--- Alert Generation Latency (Measured) ---")
             print(f"  First alert after run start : {min_latency:.2f} s")
             print(f"  Last  alert after run start : {max_latency:.2f} s")
-            print(f"  (CE evaluation interval = 1.0 s;")
-            print(f"   worst-case per-event latency = ~1.0 s)")
+            print("  (CE evaluation interval = 1.0 s;")
+            print("   worst-case per-event latency = ~1.0 s)")
 
-        # ── CPU / memory ─────────────────────────────────────────────────
-        # FIX: print the actually-collected metrics instead of the placeholder
-        # string "CPU/Memory profiles logged during execution."
-        print(f"\n--- CPU / Memory Usage (sampled every 1s) ---")
+        print("\n--- CPU / Memory Usage (sampled every 1s) ---")
         if metrics_data:
             avg_cpu = sum(m['cpu_pct'] for m in metrics_data) / len(metrics_data)
             max_cpu = max(m['cpu_pct'] for m in metrics_data)
-            avg_mem = sum(m['mem_mb']  for m in metrics_data) / len(metrics_data)
-            max_mem = max(m['mem_mb']  for m in metrics_data)
+            avg_mem = sum(m['mem_mb'] for m in metrics_data) / len(metrics_data)
+            max_mem = max(m['mem_mb'] for m in metrics_data)
             print(f"  Samples Collected : {len(metrics_data)}")
             print(f"  CPU Avg / Peak    : {avg_cpu:5.1f}% / {max_cpu:5.1f}%")
             print(f"  RAM Avg / Peak    : {avg_mem:7.1f} MB / {max_mem:7.1f} MB")
         elif not PSUTIL_AVAILABLE:
-            print("  psutil not installed — install with: pip install psutil")
+            print("  psutil not installed - install with: pip install psutil")
         else:
             print("  No samples collected (run too short).")
 

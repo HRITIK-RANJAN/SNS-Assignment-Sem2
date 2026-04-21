@@ -1,6 +1,6 @@
 import logging
 import multiprocessing
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from schemas import IDSEvent
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -22,7 +22,8 @@ class NetworkSensor:
                 if raw_flow is None: # poison pill to stop
                     break
                 event = self._process_flow(raw_flow)
-                self.output_queue.put(event.to_json())
+                if event is not None:
+                    self.output_queue.put(event.to_json())
             except multiprocessing.queues.Empty:
                 continue
             except Exception as e:
@@ -32,14 +33,47 @@ class NetworkSensor:
     def stop(self):
         self.running = False
 
-    def _process_flow(self, raw_flow: Dict[str, Any]) -> IDSEvent:
+    def _process_flow(self, raw_flow: Dict[str, Any]) -> Optional[IDSEvent]:
+        required = ('src_ip', 'dst_ip', 'src_port', 'dst_port', 'protocol')
+        missing = [k for k in required if k not in raw_flow]
+        if missing:
+            logger.warning(f"Dropping malformed network flow. Missing keys: {missing}")
+            return None
+
+        src_ip = raw_flow.get('src_ip')
+        dst_ip = raw_flow.get('dst_ip')
+        src_port = raw_flow.get('src_port')
+        dst_port = raw_flow.get('dst_port')
+        protocol = raw_flow.get('protocol')
+        packet_count = raw_flow.get('packet_count', 1)
+        byte_count = raw_flow.get('byte_count', 0)
+
+        if not isinstance(src_ip, str) or not src_ip:
+            logger.warning("Dropping network flow with invalid src_ip")
+            return None
+        if not isinstance(dst_ip, str) or not dst_ip:
+            logger.warning("Dropping network flow with invalid dst_ip")
+            return None
+        if not isinstance(src_port, int) or not isinstance(dst_port, int):
+            logger.warning("Dropping network flow with invalid ports")
+            return None
+        if not isinstance(protocol, str) or not protocol:
+            logger.warning("Dropping network flow with invalid protocol")
+            return None
+        if not isinstance(packet_count, int) or packet_count < 1:
+            logger.warning("Dropping network flow with invalid packet_count")
+            return None
+        if not isinstance(byte_count, int) or byte_count < 0:
+            logger.warning("Dropping network flow with invalid byte_count")
+            return None
+
         return IDSEvent.create_network_event(
             event_type='connection',
-            src_ip=raw_flow.get('src_ip', '0.0.0.0'),
-            dst_ip=raw_flow.get('dst_ip', '0.0.0.0'),
-            src_port=raw_flow.get('src_port', 0),
-            dst_port=raw_flow.get('dst_port', 0),
-            protocol=raw_flow.get('protocol', 'TCP'),
-            packet_count=raw_flow.get('packet_count', 1),
-            byte_count=raw_flow.get('byte_count', 0)
+            src_ip=src_ip,
+            dst_ip=dst_ip,
+            src_port=src_port,
+            dst_port=dst_port,
+            protocol=protocol,
+            packet_count=packet_count,
+            byte_count=byte_count
         )

@@ -32,6 +32,7 @@ Defence-in-depth check: any alert that arrives at the AlertManager with a single
 
 | Adversary capability          | System response |
 |-------------------------------|-----------------|
+| Cross-source brute-force activity | `CrossSourceBruteForce` rule (host failures + network SSH attempts for same source) |
 | Brute-force authentication    | `BruteForce` rule (≥6 failures / 60 s, score ≥ 6.0) |
 | Fast port scanning            | `FastPortScan` rule (>20 ports / <5 s) |
 | Slow / evasive port scanning  | `SlowPortScan` rule (>20 ports / ≥5 s) with longer window |
@@ -79,6 +80,33 @@ Severity levels and their operational meaning:
 | Medium   | Moderate confidence attack; investigate |
 | High     | Strong single-source evidence; prioritise response |
 | Critical | Cross-source confirmed compromise; immediate action required |
+
+### 5.1 Rule-to-Severity Mapping (Base Severity)
+
+| Rule | Base severity | Condition summary |
+|------|---------------|-------------------|
+| `FastPortScan` | Medium | >20 distinct ports in <5 s |
+| `SlowPortScan` | Low | >20 distinct ports in >=5 s |
+| `CrossSourceBruteForce` | Critical | failed host logins + network SSH attempts corroborate same source in-window |
+| `BruteForce` | High | failed host logins exceed threshold |
+| `SuspiciousProcess` | Medium | suspicious executable observed |
+| `ReplayAttack` | Low | high-volume duplicate events in tight burst |
+| `MultiStepCompromise` | Critical | deterministic chain: failures -> success -> suspicious process |
+| `TrafficAnomaly` | Medium | z-score anomaly detector fires |
+
+### 5.2 Runtime Severity Remapping
+
+Severity does not remain static after the base mapping:
+
+1. **Single-sensor Critical downgrade**
+    - If only one sensor contributed to a `Critical` alert, it is downgraded to `High`.
+    - Enforced in CorrelationEngine and rechecked in AlertManager.
+
+2. **Cross-source elevation to Critical**
+    - CorrelationEngine tracks `(rule_name, src_ip)` in `_cross_source_seen`.
+    - If subsequent corroborating evidence for the same key arrives from a different sensor within the window, severity is elevated to `Critical`.
+
+This two-way remapping guarantees the core requirement is preserved even when future rules are added.
 
 ---
 
